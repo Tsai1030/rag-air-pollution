@@ -1,0 +1,51 @@
+/* src/index.css (或其他你的主要 CSS 檔) */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* --- 把你的自訂 CSS 規則加在這裡 --- */
+
+.prose h1 {
+  font-size: 1.8em;
+  font-weight: bold;
+  margin-top: 1.2em;
+  margin-bottom: 0.6em;
+  color: black; /* 設定為黑色 */
+}
+
+.prose h2 {
+  font-size: 1.5em;
+  font-weight: bold;
+  margin-top: 1em;
+  margin-bottom: 0.5em;
+  color: black; /* 設定為黑色 */
+}
+
+.prose h3 {
+  font-size: 1.2em;
+  font-weight: bold;
+  margin-top: 0.8em;
+  margin-bottom: 0.4em;
+  color: black; /* 設定為黑色 */
+}
+
+.prose {
+  color: black; /* 設定基礎文字顏色為黑色 */
+}
+
+.prose strong {
+  color: black; /* 確保粗體字也是黑色 */
+}
+
+.prose ul > li::marker,
+.prose ol > li::marker {
+   color: black; /* 列表標記顏色 */
+}
+
+.prose ul > li,
+.prose ol > li {
+  color: black; /* 列表文字顏色 */
+}
+
+/* --- 其他你可能有的自訂 CSS --- */

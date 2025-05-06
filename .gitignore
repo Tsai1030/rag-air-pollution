@@ -1,0 +1,11 @@
+# 忽略前端相關
+node_modules/
+dist/
+.env
+*.log
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
