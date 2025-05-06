@@ -29,7 +29,7 @@ def build_new_vectordb(documents, embeddings, persist_dir="5_5test"): #4_23test
     return vectordb
 
 # ---------- 載入 JSON 文件 ----------
-def load_documents_from_json_files():
+def load_documents_from_json_files():  #請輸入自己檔案
     file_paths = [
         r"C:\Users\USER\Desktop\資料庫目前資料\第一次測試資料\文獻資料修正版.json",
         r"C:\Users\USER\Desktop\資料庫目前資料\第一次測試資料\修正後的空汙qa.json",
@@ -138,7 +138,7 @@ if __name__ == "__main__":
     )
     logging.info(f"✅ 嵌入模型已載入：{model_name}")
 
-    # 載入 JSON 與 PDF 文件
+    # 載入 JSON 與 PDF 文件  #請輸入自己的檔案路徑
     json_documents = load_documents_from_json_files()
     pdf_paths = [
         r"C:\Users\USER\Desktop\暫定外部資料庫文獻\批量處理\Long-term exposure to NO2 and O3 and all-cause and respiratory mortality A systematic review and meta-analysis.pdf",
