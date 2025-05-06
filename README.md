@@ -1,3 +1,10 @@
+<!--
+title: RAG QA System for Air Pollution
+description: A LangChain + Chroma + Ollama powered retrieval-augmented chatbot system for answering questions about air pollution, environmental policies, and health effects.
+keywords: RAG, LangChain, air pollution, chatbot, QA system, fastapi, react, chromadb, gemma, qwen
+-->
+
+
 # 🌱 RAG 空氣污染問答系統 (RAG-based QA System on Air Pollution)
 
 本專案為一套結合語意檢索與生成式 AI 的問答系統，針對空氣污染政策、健康影響與環境法規等主題，提供精準、可查證的回應。使用者可透過前端網頁介面進行提問，系統將利用 RAG 技術結合本地文件資料庫進行語意查詢與回答生成。
