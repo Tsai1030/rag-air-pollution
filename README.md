@@ -15,9 +15,10 @@
 
 conda 建立說明 打包環境設定安裝
 
+```bash
 conda env create -f environment.yml
 conda activate test2
-
+```
 🚀 快速啟動指南
 
 🧩 前端（React + Vite）
