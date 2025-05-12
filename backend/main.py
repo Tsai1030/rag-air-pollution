@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-from fastapi import FastAPI, Body, Depends, Request
+from fastapi import FastAPI, Body, Depends, Request, HTTPException, APIRouter, Header
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_chroma import Chroma
@@ -7,17 +7,22 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import OllamaLLM
 from langchain.prompts import PromptTemplate
 from datetime import datetime
-import logging, time, json, os, torch
+import logging
+import time
+import json
+import os
+import torch
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Annotated # Annotated for Header
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from functools import lru_cache
 import random
-import re # <--- 需要 re 模組
-# import time # time 已經在上面 import 過了
+import re
+import shutil # For deleting user directories
 
 # ✅ FastAPI 初始化
 app = FastAPI()
+api_router = APIRouter(prefix="/api")
 
 
 # ✅ 判斷使用者是否有指定格式需求
@@ -26,8 +31,6 @@ def detect_format_mode(question: str) -> str:
         "請用一段話", "摘要", "表格", "表列", "條列式", "清單形式", "一句話", "說明就好",
         "summarize", "as a table", "one paragraph", "bullet points", "list format"
     ]
-    # 使用正則表達式來更精確地匹配，避免部分匹配 (例如 "條列" 不會匹配到 "無條理")
-    # 並且忽略大小寫
     if any(re.search(r'\b' + re.escape(kw) + r'\b', question, re.IGNORECASE) for kw in format_triggers) or "簡單說明" in question:
          return "custom"
     return "default"
@@ -35,83 +38,123 @@ def detect_format_mode(question: str) -> str:
 # --- Middleware Setup ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # 在生產環境中應更嚴格
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "X-Username"],
 )
-
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["*"] # 在生產環境中應指定允許的主機名
+    allowed_hosts=["*"]
 )
 
 # --- Logging Configuration ---
-# 配置日誌記錄器，增加 DEBUG 級別選項
 log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=log_level, format="%(asctime)s - %(levelname)s - %(message)s")
-logging.info(f"日誌級別設定為: {log_level}")
+logging.basicConfig(level=log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+logger.info(f"日誌級別設定為: {log_level}")
 
 
 # --- Global Variables & Constants ---
-MAX_SESSIONS = 1000
 MAX_HISTORY_PER_SESSION = 10
 device = "cuda" if torch.cuda.is_available() else "cpu"
-logging.info(f"使用設備: {device}")
+logger.info(f"使用設備: {device}")
 
 embedding = None
 vectordb = None
-available_models = {}
-chat_memory = {} # 使用 LRU Cache 可能更適合管理內存，但簡單字典也可以
-request_counters = {} # 用於速率限制
+request_counters = {}
 
-FEEDBACK_SAVE_PATH = Path("manual_feedback")
-QA_LOG_PATH = Path("qa_logs")
+FEEDBACK_SAVE_PATH_BASE = Path("user_specific_feedback")
+QA_LOG_PATH_BASE = Path("user_specific_qa_logs")
 SAVE_QA = True
-MAX_LLM_RETRIES = 1 # LLM 呼叫重試次數
+MAX_LLM_RETRIES = 1
 
-# --- Embedding Model Loading ---
+USER_DATA_BASE_DIR = Path("user_specific_chat_data")
+
+def sanitize_username(username: str) -> str:
+    if not username:
+        return "default_user"
+    sanitized = re.sub(r'[^a-zA-Z0-9_-]', '', username).lower()
+    return sanitized if sanitized else "invalid_user"
+
+def get_user_chat_data_dir(username: str) -> Path:
+    return USER_DATA_BASE_DIR / sanitize_username(username)
+
+def get_user_chats_metadata_file(username: str) -> Path:
+    return get_user_chat_data_dir(username) / "chats_metadata.json"
+
+def get_user_chat_messages_dir(username: str) -> Path:
+    return get_user_chat_data_dir(username) / "chat_messages"
+
+def get_user_feedback_save_path(username: str) -> Path:
+    return FEEDBACK_SAVE_PATH_BASE / sanitize_username(username)
+
+def get_user_qa_log_path(username: str) -> Path:
+    return QA_LOG_PATH_BASE / sanitize_username(username)
+
+async def get_current_username(x_username: Optional[str] = Header(None)) -> str:
+    # 如果 x_username 沒有在 header 中提供，FastAPI 會因為 Header(None) 將其設為 None
+    if x_username is None:
+        logger.warning("請求中未找到 X-Username Header")
+        raise HTTPException(status_code=400, detail="請求標頭中缺少 X-Username")
+    
+    sanitized = sanitize_username(x_username)
+    if not sanitized or sanitized == "invalid_user":
+        logger.warning(f"提供的用戶名 '{x_username}' 清理後無效")
+        raise HTTPException(status_code=400, detail="提供的用戶名無效")
+    
+    # ... (後續的目錄創建和返回邏輯不變) ...
+    user_data_dir = get_user_chat_data_dir(sanitized)
+    user_data_dir.mkdir(parents=True, exist_ok=True)
+    (user_data_dir / "chat_messages").mkdir(parents=True, exist_ok=True)
+    
+    user_feedback_dir = get_user_feedback_save_path(sanitized)
+    user_feedback_dir.mkdir(parents=True, exist_ok=True)
+    
+    user_qa_dir = get_user_qa_log_path(sanitized)
+    user_qa_dir.mkdir(parents=True, exist_ok=True)
+
+    return sanitized
+
 try:
-    # 考慮將模型名稱設為環境變數
     embedding_model_name = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-m3")
-    logging.info(f"正在載入嵌入模型: {embedding_model_name}")
+    logger.info(f"正在載入嵌入模型: {embedding_model_name}")
     embedding = HuggingFaceEmbeddings(
         model_name=embedding_model_name,
         model_kwargs={"device": device},
-        encode_kwargs={"normalize_embeddings": True} # bge-m3 建議設為 True
+        encode_kwargs={"normalize_embeddings": True}
     )
-    # 測試嵌入模型是否正常工作
     _ = embedding.embed_query("測試嵌入模型")
-    logging.info("✅ 嵌入模型載入並測試成功")
+    logger.info("✅ 嵌入模型載入並測試成功")
 except Exception as e:
-    logging.error(f"❌ 嵌入模型載入失敗: {str(e)}", exc_info=True)
-    embedding = None # 確保失敗時為 None
+    logger.error(f"❌ 嵌入模型載入失敗: {str(e)}", exc_info=True)
+    embedding = None
 
-# --- Vector Database Loading (on Startup) ---
 @app.on_event("startup")
-def load_vector_database():
+def startup_event():
     global vectordb
     if embedding is None:
-        logging.error("❌ 嵌入模型未載入，無法初始化向量資料庫。")
-        return
-    try:
-        # 考慮將資料庫路徑設為環境變數
-        persist_dir = os.environ.get("VECTORDB_PATH", "5_5test")
-        logging.info(f"正在從 '{persist_dir}' 載入向量資料庫...")
-        if not os.path.exists(persist_dir):
-            logging.error(f"❌ 向量資料庫目錄 '{persist_dir}' 不存在，請建立或檢查路徑。")
-            return
-        vectordb = Chroma(persist_directory=persist_dir, embedding_function=embedding)
-        # 嘗試進行一次查詢以預熱並驗證
-        _ = vectordb.similarity_search("系統預熱", k=1)
-        logging.info(f"✅ 向量資料庫從 '{persist_dir}' 載入並預熱完成")
-    except Exception as e:
-        logging.error(f"❌ 向量資料庫載入失敗: {str(e)}", exc_info=True)
-        vectordb = None # 確保失敗時為 None
+        logger.error("❌ 嵌入模型未載入，無法初始化向量資料庫。")
+    else:
+        try:
+            persist_dir = os.environ.get("VECTORDB_PATH", "5_10test")
+            logger.info(f"正在從 '{persist_dir}' 載入向量資料庫...")
+            if not os.path.exists(persist_dir):
+                logger.error(f"❌ 向量資料庫目錄 '{persist_dir}' 不存在。")
+            else:
+                vectordb = Chroma(persist_directory=persist_dir, embedding_function=embedding)
+                _ = vectordb.similarity_search("系統預熱", k=1)
+                logger.info(f"✅ 向量資料庫從 '{persist_dir}' 載入並預熱完成")
+        except Exception as e:
+            logger.error(f"❌ 向量資料庫載入失敗: {str(e)}", exc_info=True)
+            vectordb = None
+    
+    USER_DATA_BASE_DIR.mkdir(parents=True, exist_ok=True)
+    FEEDBACK_SAVE_PATH_BASE.mkdir(parents=True, exist_ok=True)
+    QA_LOG_PATH_BASE.mkdir(parents=True, exist_ok=True)
+    logger.info(f"用戶特定數據的基礎目錄已準備就緒: {USER_DATA_BASE_DIR}")
 
 # --- Prompt Templates ---
-# (保持你提供的 Prompt 模板不變，這裡省略以節省空間)
-# --- 風格 1：結構化列表 ---
 STRUCTURED_LIST_PROMPT = PromptTemplate(
     input_variables=["question", "context", "history", "format_mode"],
     template="""
@@ -149,24 +192,22 @@ You are a helpful assistant providing clear and structured information in **Trad
 
 **一、社區參與與教育推廣**
 計畫團隊深入小港區的學校 🏫 與社區 👥，舉辦各類環境與健康教育活動，例如針對空污敏感族群的兒童氣喘衛教營隊，以及在鳳林國小舉辦的「空污健康站」環境教育嘉年華。這些活動吸引了數百名小港地區居民參與，成功將空污知識轉化為社區行動。
-....................................................................................................
+.................................................................................................................................................................
 
 **二、針對特定族群的健康促進**
 計畫針對空污敏感族群的兒童氣喘進行衛教，並擴及高齡族群，例如舉辦高齡者社區健康促進講座和長照據點合作的呼吸保健課程。這些活動提升了不同年齡層對空氣品質與健康風險的認知，並促進了健康行為的改變 ❤️。
-....................................................................................................
+.................................................................................................................................................................
 
 **三、與企業合作的亮點**
 計畫與小港醫院及地方企業合作 🤝 推動空污監測系統和ESG健康促進方案，顯示計畫在整合資源、促進社區發展方面的努力。
-....................................................................................................
+.................................................................................................................................................................
 
 **四、計畫目標的落實與成果分享**
 計畫申請書完整闡述了小港空污議題的背景、目標、執行方案與預期效益 📊，並定期提交進度與成果報告，確保計畫目標的落實，並通過多元方式進行成效評估與分享。
-....................................................................................................
+.................................................................................................................................................................
 """
 )
-# --- 風格 2：階層式條列 ---
-# --- Style 2: Hierarchical Lists (English Instructions, Chinese Output) ---
-# --- Style 2: Hierarchical Lists (English Instructions, Chinese Output - Revised) ---
+
 HIERARCHICAL_BULLETS_PROMPT = PromptTemplate(
     input_variables=["question", "context", "history", "format_mode"],
     template="""
@@ -259,7 +300,7 @@ You are a helpful assistant tasked with providing detailed, hierarchically struc
 *(Note: The example output deliberately excludes concluding summaries or questions.)*
 """
 )
-# --- 風格 3：段落前置圖標 ---
+
 PARAGRAPH_EMOJI_LEAD_PROMPT = PromptTemplate(
     input_variables=["question", "context", "history", "format_mode"],
     template="""
@@ -297,7 +338,7 @@ You are a helpful assistant providing clear, paragraph-based explanations in **T
 ✅ 總之，USR計畫透過與醫療機構的合作，從多個層面推動社區健康促進工作，確保了居民能夠獲得全面且有效的健康管理服務。
 """
 )
-# --- 模板：處理使用者在問題中指定格式的情況 ---
+
 CUSTOM_FORMAT_BASE_PROMPT = PromptTemplate(
     input_variables=["question", "context", "history", "format_mode"],
     template="""
@@ -324,7 +365,7 @@ You are a helpful assistant providing information in **Traditional Chinese**. Th
 👇 **請用繁體中文回答。絕對優先遵循使用者問題中的格式要求。若無明確要求，則以標準段落回答。請確保 Markdown 語法使用正確。**
 """
 )
-# --- 模板：研究報告模式 ---
+
 RESEARCH_PROMPT_TEMPLATE = PromptTemplate(
     input_variables=["question", "context", "history", "format_mode"],
     template="""
@@ -402,7 +443,6 @@ You are a policy analyst and academic writer providing an evaluation in **Tradit
 """
 )
 
-
 DEFAULT_PROMPT_OPTIONS = [
     STRUCTURED_LIST_PROMPT,
     HIERARCHICAL_BULLETS_PROMPT,
@@ -411,73 +451,47 @@ DEFAULT_PROMPT_OPTIONS = [
 
 # --- LLM Configuration and Loading ---
 common_llm_config = { "temperature": 0.1, "top_p": 0.8 }
-# 考慮將模型列表設為環境變數或配置文件
 SUPPORTED_MODELS = [
-    "qwen2.5:14b",
-    "gemma3:12b",
-    "gemma3:12b-it-q4_K_M",
-    "qwen2.5:14b-instruct-q5_K_M",
-    "mistral-small3.1:24b-instruct-2503-q4_K_M",
-    "phi4-mini-reasoning:3.8b",
+    "qwen2.5:14b", "gemma3:12b", "gemma3:12b-it-q4_K_M", "qwen2.5:14b-instruct-q5_K_M",
 ]
-# 預設模型，如果前端沒傳或傳了不支援的
-DEFAULT_MODEL = "gemma3:12b-it-q4_K_M" # 或者選擇一個最常用的
+DEFAULT_MODEL = "gemma3:12b"
 
-@lru_cache(maxsize=5) # 根據你同時使用的模型數量調整緩存大小
+@lru_cache(maxsize=5)
 def get_model(model_name: str) -> Optional[OllamaLLM]:
-    """載入並緩存 Ollama 模型"""
     if model_name not in SUPPORTED_MODELS:
-        logging.warning(f"⚠️ 請求的模型 '{model_name}' 不在支援列表中，將使用預設模型 '{DEFAULT_MODEL}'。")
+        logger.warning(f"⚠️ 請求的模型 '{model_name}' 不在支援列表，將使用預設模型 '{DEFAULT_MODEL}'。")
         model_name = DEFAULT_MODEL
-
     try:
-        logging.info(f"⏳ 正在載入或獲取緩存的模型: {model_name}...")
-        # 增加請求超時時間，防止大模型載入過久
+        logger.info(f"⏳ 正在載入或獲取緩存的模型: {model_name}...")
         model = OllamaLLM(model=model_name, **common_llm_config, request_timeout=300.0)
-        # 進行一次簡單的調用以確保模型可用 (或預熱)
         _ = model.invoke("請做個自我介紹")
-        logging.info(f"✅ 模型 {model_name} 載入並測試成功")
+        logger.info(f"✅ 模型 {model_name} 載入並測試成功")
         return model
     except Exception as e:
-        logging.error(f"❌ 載入或測試模型 {model_name} 失敗: {str(e)}", exc_info=True)
+        logger.error(f"❌ 載入或測試模型 {model_name} 失敗: {str(e)}", exc_info=True)
         return None
 
-# --- Rate Limiting Middleware ---
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    # 只對 /chat 路由進行限制
     if "/chat" not in str(request.url):
         return await call_next(request)
-
     client_ip = request.client.host if request.client else "unknown"
     current_time = time.time()
-
-    # 清理過期的時間戳
     request_timestamps = request_counters.get(client_ip, [])
-    valid_timestamps = [t for t in request_timestamps if current_time - t < 60] # 保留 60 秒內的記錄
-
-    # 檢查請求次數 (例如，每分鐘 30 次)
+    valid_timestamps = [t for t in request_timestamps if current_time - t < 60]
     rate_limit_count = 30
     if len(valid_timestamps) >= rate_limit_count:
-        logging.warning(f"🚦 速率限制觸發: IP {client_ip} 已達到 {rate_limit_count}/分鐘 的限制。")
+        logger.warning(f"🚦 速率限制觸發: IP {client_ip}")
         from fastapi.responses import JSONResponse
-        return JSONResponse(
-            status_code=429, # Too Many Requests
-            content={"error": "請求過於頻繁，請稍後再試"}
-        )
-
-    # 添加當前時間戳
+        return JSONResponse(status_code=429, content={"error": "請求過於頻繁"})
     valid_timestamps.append(current_time)
     request_counters[client_ip] = valid_timestamps
+    return await call_next(request)
 
-    response = await call_next(request)
-    return response
-
-# --- Pydantic Models ---
 class ChatRequest(BaseModel):
     session_id: str
     question: str
-    model: Optional[str] = DEFAULT_MODEL # 允許前端不傳，使用預設值
+    model: Optional[str] = DEFAULT_MODEL
     prompt_mode: str = "default"
 
 class FeedbackRequest(BaseModel):
@@ -488,410 +502,395 @@ class FeedbackRequest(BaseModel):
     user_expected_question: Optional[str] = None
     user_expected_answer: str
 
-# --- Directory Setup ---
-try:
-    FEEDBACK_SAVE_PATH.mkdir(parents=True, exist_ok=True)
-    QA_LOG_PATH.mkdir(parents=True, exist_ok=True)
-    # 檢查寫入權限 (雖然 mkdir 通常會拋出錯誤，但多一層保險)
-    if not os.access(FEEDBACK_SAVE_PATH, os.W_OK):
-        logging.error(f"❌ 權限不足：無法寫入目錄 {FEEDBACK_SAVE_PATH}")
-    if not os.access(QA_LOG_PATH, os.W_OK):
-        logging.error(f"❌ 權限不足：無法寫入目錄 {QA_LOG_PATH}")
-except Exception as e:
-    logging.error(f"❌ 建立儲存目錄時發生錯誤: {str(e)}", exc_info=True)
+class ChatListItem(BaseModel):
+    id: str
+    title: str
+    updated_at: str
 
+class NewChatRequest(BaseModel):
+    id: str
+    title: str
 
-# ==============================================================================
-#  Post-processing Function (V7)
-# ==============================================================================
-def post_process_answer(answer: str) -> str:
-    """
-    對 LLM 的原始回答進行後處理，清理格式並轉換 Markdown 為 HTML。
-    版本：V9.1 (整合標題轉換, 修正星號處理, 移除元語言/來源評論, 處理標記後粗體, 移除特定括號註釋)
-    """
-    original_answer_before_cleanup = answer
+class RenameChatRequest(BaseModel):
+    title: str
+
+class Message(BaseModel):
+    role: str
+    content: str
+
+def _load_user_chats_metadata(username: str) -> Dict[str, Dict[str, str]]:
+    metadata_file = get_user_chats_metadata_file(username)
+    if metadata_file.exists():
+        try:
+            with open(metadata_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"❌ 無法為用戶 {username} 加載聊天元數據: {e}", exc_info=True)
+    return {}
+
+def _save_user_chats_metadata(username: str, metadata: Dict[str, Dict[str, str]]):
+    metadata_file = get_user_chats_metadata_file(username)
     try:
-        logging.debug(f"Post-processing V9.1 - Input: {answer[:200]}...")
+        sorted_metadata = dict(sorted(metadata.items(), key=lambda item: item[1].get('updated_at', ''), reverse=True))
+        with open(metadata_file, "w", encoding="utf-8") as f:
+            json.dump(sorted_metadata, f, ensure_ascii=False, indent=2)
+        logger.debug(f"用戶 {username} 的聊天元數據已保存到 {metadata_file}")
+    except Exception as e:
+        logger.error(f"❌ 保存用戶 {username} 的聊天元數據失敗: {e}", exc_info=True)
 
-        # === V8/V9.1 Start: 移除元語言、來源評論和特定語句/註釋 ===
-        # 移除開頭干擾語句 (V8)
-        patterns_to_remove_at_start = [
-            r"^\s*根據提供的文本[,，]?\s*", r"^\s*文本指出[,，]?\s*",
+def _get_user_chat_messages(username: str, chat_id: str) -> List[Dict[str, str]]:
+    message_file = get_user_chat_messages_dir(username) / f"{chat_id}.json"
+    if message_file.exists():
+        try:
+            with open(message_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"❌ 無法讀取用戶 {username} 聊天 {chat_id} 的訊息: {e}", exc_info=True)
+    return []
+
+def _save_user_chat_messages(username: str, chat_id: str, messages: List[Dict[str, str]]):
+    message_file = get_user_chat_messages_dir(username) / f"{chat_id}.json"
+    try:
+        with open(message_file, "w", encoding="utf-8") as f:
+            json.dump(messages, f, ensure_ascii=False, indent=2)
+        logger.debug(f"用戶 {username} 聊天 {chat_id} 的訊息已保存到 {message_file}")
+    except Exception as e:
+        logger.error(f"❌ 保存用戶 {username} 聊天 {chat_id} 的訊息失敗: {e}", exc_info=True)
+
+
+def post_process_answer(answer: str) -> str:
+    original_answer = answer
+    try:
+        # 1. 移除開頭多餘片語
+        patterns = [
+            r"^\s*根據提供的文本[,，]?\s*",
+            r"^\s*文本指出[,，]?\s*",
             r"^\s*文本未(?:直接)?提及(?:，|,)但可以推斷[,，]?\s*",
-            r"^\s*以下將.*?格式呈現：?\s*", r"^\s*這份文件提到(?:了)?",
-            r"^\s*好的[,，]?\s*", r"^\s*是的[,，]?\s*",
+            r"^\s*以下將.*?格式呈現：?\s*",
+            r"^\s*這份文件提到(?:了)?\s*",
+            r"^\s*好的[,，]?\s*",
+            r"^\s*是的[,，]?\s*",
             r"^\s*Here is the.*?you requested[:.]?\s*",
         ]
-        for pattern in patterns_to_remove_at_start:
-            original_len = len(answer)
-            answer = re.sub(pattern, "", answer, count=1, flags=re.IGNORECASE | re.MULTILINE).lstrip()
-            if len(answer) != original_len:
-                 logging.info(f"Post-processing V9.1 - Removed start pattern matching: '{pattern}'")
+        for p in patterns:
+            answer = re.sub(p, "", answer, count=1, flags=re.IGNORECASE|re.MULTILINE).lstrip()
 
-        # 委婉替換特定句子 (V8)
-        def replace_lack_of_enforcement(match):
-            logging.info("Post-processing V9.1 - Replacing 'lack of enforcement' phrase.")
-            return "執法機制的有效性是影響改善速度的關鍵因素。"
+        # 2. 自訂替換範例（保留）
+        def replace_lack(m): return "執法機制的有效性是影響改善速度的關鍵因素。"
         answer = re.sub(
             r"(\n\s*|\A\s*)(缺乏嚴格的執法機制.*?)(?:\s*。|\s*\n|\s*$)",
-            lambda m: m.group(1) + replace_lack_of_enforcement(m),
+            lambda m: m.group(1) + replace_lack(m),
             answer, flags=re.MULTILINE
         )
         answer = re.sub(
-            r"(\n\s*|\A\s*)(這可能涉及.*?(?:。|\n|$))", r"\1",
-            answer, flags=re.MULTILINE
+            r"(\n\s*|\A\s*)(這可能涉及.*?(?:。|\n|$))",
+            r"\1", answer, flags=re.MULTILINE
         )
-        logging.debug("Post-processing V9.1 - Specific sentence replacements: Done")
 
-        # --- 新增 V9.1: 移除標題中特定的括號註釋 ---
-        # 精確匹配 "(文本未直接提及，但可推測)"，包含前後可能存在的空格
-        # 使用 re.escape 來處理括號的特殊字符
-        phrase_to_remove = "(文本未直接提及，但可推測)"
-        # 建立正則表達式，匹配括號本身以及前後的空格
-        # \s* 匹配零個或多個空格， re.escape 處理括號
-        unwanted_phrase_pattern = r'\s*' + re.escape(phrase_to_remove) + r'\s*'
-        original_len_v9_1 = len(answer)
-        # 直接替換為空字串，相當於移除
-        answer = re.sub(unwanted_phrase_pattern, '', answer)
-        if len(answer) != original_len_v9_1:
-            logging.info(f"Post-processing V9.1 - Removed specific parenthetical phrase: '{phrase_to_remove}'")
-        # === V8/V9.1 End ===
-
-
-        # --- 清理潛在的、由 LLM 錯誤添加的提示詞殘留 (V8) ---
-        markers_to_remove = [
-            "📘 Conversation History:", "📄 Retrieved Context:", "❓ User Question:",
-            "👇 Please write your answer", "📝 EXAMPLE OUTPUT FORMAT",
-            "You are a helpful assistant", "You are a policy analyst"
+        # 3. 移除不想要的短語
+        to_remove = [
+            "(文本未直接提及，但可推測)",
+            "文章多次提及", "文章提及",
+            "文本提及", "根據文本",
+            "文件提及", "根據文件",
+            "可推論", "但可推論"
         ]
-        for marker in markers_to_remove:
-            if marker in answer:
-                logging.warning(f"⚠️ 在後處理中發現殘留標記 '{marker}'，將其移除。")
-                answer_parts = answer.split(marker, 1)
-                if len(answer_parts) > 0:
-                    answer = answer_parts[0].strip()
-        logging.debug("Post-processing V9.1 - Marker removal: Done")
+        for ph in to_remove:
+            answer = answer.replace(ph, "")
 
-        # ── V5：常規星號清理 ────────────────────────── (簡化版，因為V9會處理標記後粗體)
-        answer = re.sub(r'\*{3,}', '**', answer)
-        answer = answer.replace('** ', '**').replace(' **', '**')
-        logging.debug("Post-processing V9.1 - V5 Asterisk cleanup (basic): Done")
+        # 4. 簡化空白與標點間距
+        answer = re.sub(r'[ \t]{2,}', ' ', answer)
+        answer = re.sub(r'\s+([,.:;!?，。：；！？])', r'\1', answer)
+        answer = re.sub(r'([,.:;!?，。：；！？])([^\s,.:;!?，。：；！？\n])', r'\1 \2', answer)
+        answer = re.sub(r'^\s*[,，：:]\s*', '', answer).strip()
 
-        # ── V6：bullet 轉換 ─────────────────────────────
-        answer = re.sub(r'(?m)^\s*([*-])\s+', '• ', answer)
-        logging.debug("Post-processing V9.1 - V6 Bullet conversion: Done")
+        # 5. 移除系統標記
+        markers = [
+            "📘 Conversation History:", "📄 Retrieved Context:",
+            "❓ User Question:", "👇 Please write your answer",
+            "📝 EXAMPLE OUTPUT FORMAT", "You are a helpful assistant",
+            "You are a policy analyst"
+        ]
+        for m in markers:
+            if m in answer:
+                answer = answer.split(m, 1)[0].strip()
 
-        # === V9: 移除標記/冒號後不正確的粗體 ===
-        original_len_v9 = len(answer)
+        # 6. 統一列表符號：將行首 * 或 -（有無空格）都改為 • 
+        answer = re.sub(r'(?m)^\s*[\*\-]\s*', '• ', answer)
+
+        # 7a. 只針對「• *一、…」這種情況，移除「• 」後面單一星號
         answer = re.sub(
-            r'(?m)^(\s*(?:(?:[^:\n]+:)|[•]|\d+\.)\s*)\*\*(.+?)\*\*', # 假設 V6 已轉為 •
-            # r'(?m)^(\s*(?:(?:[^:\n]+:)|[•*-]|\d+\.)\s*)\*\*(.+?)\*\*', # 如果需要處理 * 或 -
-            r'\1 \2',
+            r'(?m)^(•\s*)\*(?=[一二三四五六七八九十]+、)',
+            r'\1',
             answer
         )
-        if len(answer) != original_len_v9:
-            logging.info("Post-processing V9.1 - Removed incorrect bolding immediately after list markers or colons.")
-        # === V9 End ===
+        # 7b. 同時移除行尾多餘的單一星號（如果有），例如「• 一、標題*」
+        answer = re.sub(
+            r'(?m)^(•.*?)[*]+\s*$',
+            r'\1',
+            answer
+        )
 
-
-        # ── V7：Markdown 標題轉換為 HTML ─────────────────
-        if re.search(r'(?m)^#{1,3}[^#\s]', answer):
-             logging.warning(f"Post-processing V9.1 - Detected potential heading missing space before conversion: {answer[:200]}")
-        logging.info(f"Post-processing V9.1 - Before heading conversion: {answer[:200]}")
+        # 8. 處理多重星號與標題標記（保留既有邏輯）
+        answer = re.sub(r'\*{3,}', '**', answer)
+        answer = answer.replace('** ', '**').replace(' **', '**')
         answer = re.sub(r'(?m)^###\s+(.*?)\s*$', r'<h3>\1</h3>', answer)
         answer = re.sub(r'(?m)^##\s+(.*?)\s*$', r'<h2>\1</h2>', answer)
         answer = re.sub(r'(?m)^#\s+(.*?)\s*$', r'<h1>\1</h1>', answer)
-        logging.info(f"Post-processing V9.1 - After heading conversion: {answer[:200]}")
-
-        # ── V7 (續)：最終 Markdown 轉換與清理 ────────────
         answer = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', answer)
-        logging.debug("Post-processing V9.1 - Final ** to <strong> conversion: Done")
-        # (可選移除單星號)
-        # answer = answer.replace('*', '')
 
-        # --- 清理多餘空行和首尾空格 ---
-        answer = answer.strip()
-        answer = re.sub(r'\n{3,}', '\n\n', answer)
-        logging.debug("Post-processing V9.1 - Trailing newline cleanup: Done")
+        # 9. 清理多餘換行
+        answer = re.sub(r'\n{3,}', '\n\n', answer).strip()
 
-        # 最終檢查，如果處理後變為空字串，恢復原始答案
-        if not answer.strip() and original_answer_before_cleanup.strip():
-            logging.warning("Post-processing V9.1 resulted in empty string, reverting to original.")
-            return original_answer_before_cleanup.strip()
+        # 10. 若結果為空，回傳原始
+        return answer or original_answer
 
-        if answer != original_answer_before_cleanup:
-            logging.info("Applied post-processing V9.1 (Parenthetical removal, etc.).")
-        else:
-            logging.info("Post-processing V9.1 did not significantly change the answer.")
+    except Exception as e:
+        logger.error(f"❌ Post-processing failed: {e}", exc_info=True)
+        return original_answer
 
-        return answer
 
-    except Exception as post_process_error:
-        logging.error(f"❌ Post-processing V9.1 failed: {post_process_error}", exc_info=True)
-        return original_answer_before_cleanup.strip()
 
-# ==============================================================================
-#  API Endpoints
-# ==============================================================================
+
+
+@api_router.get("/chats", response_model=List[ChatListItem])
+async def get_chat_list_for_user(username: str = Depends(get_current_username)):
+    user_chats_metadata = _load_user_chats_metadata(username)
+    chat_list = [
+        ChatListItem(id=chat_id, title=meta.get("title", "無標題"), updated_at=meta.get("updated_at", ""))
+        for chat_id, meta in user_chats_metadata.items()
+    ]
+    chat_list.sort(key=lambda x: x.updated_at, reverse=True)
+    return chat_list
+
+@api_router.post("/chats", response_model=ChatListItem)
+async def create_new_chat_for_user(req: NewChatRequest, username: str = Depends(get_current_username)):
+    user_chats_metadata = _load_user_chats_metadata(username)
+    chat_id = req.id
+    title = req.title
+    if chat_id in user_chats_metadata:
+        raise HTTPException(status_code=409, detail=f"聊天 ID {chat_id} 已存在")
+    
+    now_iso = datetime.now().isoformat()
+    user_chats_metadata[chat_id] = {"title": title, "created_at": now_iso, "updated_at": now_iso}
+    _save_user_chats_metadata(username, user_chats_metadata)
+    _save_user_chat_messages(username, chat_id, [])
+    logger.info(f"✅ 用戶 {username} 的新聊天已創建: ID={chat_id}, Title='{title}'")
+    return ChatListItem(id=chat_id, title=title, updated_at=now_iso)
+
+@api_router.get("/chats/{chat_id}/messages", response_model=List[Message])
+async def get_chat_messages_for_user(chat_id: str, username: str = Depends(get_current_username)):
+    user_chats_metadata = _load_user_chats_metadata(username)
+    if chat_id not in user_chats_metadata:
+        logger.warning(f"用戶 {username} 請求不存在的聊天 {chat_id} 的訊息。")
+        raise HTTPException(status_code=404, detail=f"聊天 ID {chat_id} 未找到")
+
+    messages = _get_user_chat_messages(username, chat_id)
+    return [Message(role=msg["role"], content=msg["content"]) for msg in messages]
+
+@api_router.put("/chats/{chat_id}", response_model=ChatListItem)
+async def rename_chat_for_user(chat_id: str, req: RenameChatRequest, username: str = Depends(get_current_username)):
+    user_chats_metadata = _load_user_chats_metadata(username)
+    if chat_id not in user_chats_metadata:
+        raise HTTPException(status_code=404, detail=f"聊天 ID {chat_id} 未找到")
+    
+    new_title = req.title.strip()
+    if not new_title:
+        raise HTTPException(status_code=400, detail="標題不能為空")
+    
+    now_iso = datetime.now().isoformat()
+    user_chats_metadata[chat_id]["title"] = new_title
+    user_chats_metadata[chat_id]["updated_at"] = now_iso
+    _save_user_chats_metadata(username, user_chats_metadata)
+    logger.info(f"✅ 用戶 {username} 的聊天已重命名: ID={chat_id}, New Title='{new_title}'")
+    return ChatListItem(id=chat_id, title=new_title, updated_at=now_iso)
+
+@api_router.delete("/chats/{chat_id}", status_code=204)
+async def delete_chat_for_user(chat_id: str, username: str = Depends(get_current_username)):
+    user_chats_metadata = _load_user_chats_metadata(username)
+    if chat_id not in user_chats_metadata:
+        raise HTTPException(status_code=404, detail=f"聊天 ID {chat_id} 未找到")
+    
+    del user_chats_metadata[chat_id]
+    _save_user_chats_metadata(username, user_chats_metadata)
+    
+    message_file = get_user_chat_messages_dir(username) / f"{chat_id}.json"
+    if message_file.exists():
+        try:
+            message_file.unlink()
+            logger.info(f"用戶 {username} 的聊天訊息文件 {message_file} 已刪除。")
+        except Exception as e:
+            logger.error(f"❌ 刪除用戶 {username} 的聊天訊息文件 {message_file} 失敗: {e}", exc_info=True)
+    
+    logger.info(f"🗑️ 用戶 {username} 的聊天已刪除: ID={chat_id}")
+    if not user_chats_metadata:
+        user_chat_dir = get_user_chat_data_dir(username)
+        try:
+            messages_dir = get_user_chat_messages_dir(username)
+            if not any(messages_dir.iterdir()):
+                shutil.rmtree(user_chat_dir)
+                logger.info(f"用戶 {username} 的數據目錄 {user_chat_dir} 因無聊天記錄而被刪除。")
+        except Exception as e:
+            logger.error(f"❌ 刪除空的用戶 {username} 數據目錄 {user_chat_dir} 失敗: {e}", exc_info=True)
+    return None
 
 @app.post("/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, username: str = Depends(get_current_username)):
     start_all = time.time()
     session_id = req.session_id
-    question = req.question.strip() # 清理用戶問題的首尾空格
+    question = req.question.strip()
     selected_model = req.model if req.model in SUPPORTED_MODELS else DEFAULT_MODEL
     prompt_mode = req.prompt_mode if req.prompt_mode in ["default", "research"] else "default"
 
-    # 如果問題為空，直接返回
     if not question:
-        logging.warning("⚠️ Received empty question.")
+        logger.warning(f"⚠️ 用戶 {username} 收到空問題。")
         return {"error": "問題不能為空"}
 
-    # --- 獲取 LLM 和 VectorDB ---
     llm = get_model(selected_model)
-    if llm is None:
-        # get_model 內部已經 log 過錯誤
-        return {"error": f"無法載入語言模型 '{selected_model}'，請稍後再試或聯繫管理員。"}
-
+    if llm is None: return {"error": f"無法載入語言模型 '{selected_model}'"}
     if vectordb is None:
-        logging.error("❌ /chat error: Vector database not available.")
-        return {"error": "向量資料庫不可用，請聯繫管理員。"}
+        logger.error(f"❌ /chat error for user {username}: Vector database not available.")
+        return {"error": "向量資料庫不可用"}
 
-    # --- 格式模式檢測 ---
+    user_chats_metadata = _load_user_chats_metadata(username)
+    if session_id not in user_chats_metadata:
+        now_iso = datetime.now().isoformat()
+        default_title = f"對話 {session_id[:8]}"
+        if question:
+            first_message_title = question[:30] + "..." if len(question) > 30 else question
+            default_title = first_message_title
+
+        user_chats_metadata[session_id] = {"title": default_title, "created_at": now_iso, "updated_at": now_iso}
+        _save_user_chats_metadata(username, user_chats_metadata)
+        _save_user_chat_messages(username, session_id, [])
+        logger.info(f"ℹ️ 自動為用戶 {username} 的 session_id '{session_id}' 創建了聊天元數據。標題: '{default_title}'")
+
     detected_format_mode = detect_format_mode(question)
-    # 如果 prompt_mode 是 research，則 format_mode 也跟隨檢測結果
-    # 如果 prompt_mode 是 default，則 format_mode 也跟隨檢測結果
-    # （目前看起來 format_mode 總是跟隨 detected_format_mode）
     format_mode = detected_format_mode
+    logger.info(f"🚀 Request - User: {username}, ChatID: {session_id}, Model: {selected_model}, PromptMode: {prompt_mode}, FormatMode: {format_mode}")
+    logger.info(f"❓ Question: {question}")
 
-    logging.info(f"🚀 Request - Session: {session_id}, Model: {selected_model}, PromptMode(Frontend): {prompt_mode}, FormatMode(Used): {format_mode}")
-    logging.info(f"❓ Question: {question}")
+    messages_for_prompt = _get_user_chat_messages(username, session_id)
+    history_pairs = []
+    temp_user_q = None
+    for msg_dict in messages_for_prompt:
+        if msg_dict["role"] == "user": temp_user_q = msg_dict["content"]
+        elif msg_dict["role"] == "assistant" and temp_user_q:
+            history_pairs.append((temp_user_q, msg_dict["content"]))
+            temp_user_q = None
+    history_text = "\n".join([f"使用者: {q}\n助理: {a}" for q, a in history_pairs[-MAX_HISTORY_PER_SESSION:]]) if history_pairs else "無歷史對話紀錄。"
 
-    # --- History Management ---
-    history = chat_memory.get(session_id, [])
-    # 清理過長的歷史記錄
-    if len(history) > MAX_HISTORY_PER_SESSION:
-        history = history[-MAX_HISTORY_PER_SESSION:]
-        chat_memory[session_id] = history
-        logging.info(f"Session {session_id} history truncated to {MAX_HISTORY_PER_SESSION} entries.")
-    history_text = "\n".join([f"使用者: {q}\n助理: {a}" for q, a in history]) if history else "無歷史對話紀錄。"
-
-    # --- Retrieval ---
     start_retrieve = time.time()
-    # 考慮將檢索參數設為可配置
-    retriever_k = 15
-    retriever_fetch_k = 25
-    retriever_lambda_mult = 0.9
-    retriever = vectordb.as_retriever(
-        search_type="mmr",
-        search_kwargs={
-            "k": retriever_k,
-            "fetch_k": retriever_fetch_k,
-            "lambda_mult": retriever_lambda_mult
-        }
-    )
-    context = ""
-    docs = []
+    retriever_k = 20; retriever_fetch_k = 50; retriever_lambda_mult = 0.8
+    retriever = vectordb.as_retriever(search_type="mmr", search_kwargs={"k": retriever_k, "fetch_k": retriever_fetch_k, "lambda_mult": retriever_lambda_mult})
+    context = ""; docs = []
     try:
-        # Langchain 的 BGE HF Embeddings 通常不需要 "query: " 前綴
-        # 但如果你的數據庫是這樣構建的，則保留
-        # question_for_retrieval = f"query: {question}"
-        question_for_retrieval = question
-        docs = retriever.invoke(question_for_retrieval)
-        if not docs:
-            logging.warning(f"⚠️ Retrieval warning: No relevant documents found for question: '{question}'")
-            context = "沒有找到相關的背景資料。" # 或者返回一個提示信息
-        else:
-            context = "\n\n".join([doc.page_content for doc in docs])
-            logging.info(f"Retrieved {len(docs)} documents.")
-        end_retrieve = time.time()
-        logging.info(f"⏱️ Retrieval time: {end_retrieve - start_retrieve:.2f}s")
-        logging.debug(f"Retrieved context snippet: {context[:200]}...")
+        docs = retriever.invoke(question)
+        if not docs: context = "沒有找到相關的背景資料。"
+        else: context = "\n\n".join([doc.page_content for doc in docs])
+        logger.info(f"⏱️ Retrieval time: {time.time() - start_retrieve:.2f}s, Found {len(docs)} docs.")
     except Exception as e:
-        logging.error(f"❌ Retrieval error for question '{question}': {str(e)}", exc_info=True)
-        # 即使檢索失敗，也可以考慮繼續（不帶上下文），或者返回錯誤
+        logger.error(f"❌ Retrieval error for user {username}, q='{question}': {str(e)}", exc_info=True)
         return {"error": f"向量資料庫檢索錯誤：{str(e)}"}
-
-    # --- Prompt Template Selection ---
-    selected_template = None
-    template_name = "N/A"
+    
+    selected_template = None; template_name = "N/A"
     if prompt_mode == "research":
         selected_template = RESEARCH_PROMPT_TEMPLATE
-        # 研究模式下也區分 default/custom 格式
-        template_name = f"Research Report ({'User Format' if format_mode == 'custom' else 'Default Format'})"
+        template_name = f"Research ({'User Format' if format_mode == 'custom' else 'Default Format'})"
     elif format_mode == "custom":
         selected_template = CUSTOM_FORMAT_BASE_PROMPT
         template_name = "Custom Format Request"
-    else: # prompt_mode is default and format_mode is default
+    else:
         selected_template = random.choice(DEFAULT_PROMPT_OPTIONS)
-        # 確定隨機選擇的模板名稱
         if selected_template == STRUCTURED_LIST_PROMPT: template_name = "Default Style (Random: Structured List)"
         elif selected_template == HIERARCHICAL_BULLETS_PROMPT: template_name = "Default Style (Random: Hierarchical Bullets)"
         elif selected_template == PARAGRAPH_EMOJI_LEAD_PROMPT: template_name = "Default Style (Random: Paragraph Emoji Lead)"
         else: template_name = "Default Style (Random: Unknown)"
-    logging.info(f"Using template: {template_name}")
-
-    # --- Prompt Formatting ---
+    logger.info(f"Using template for user {username}: {template_name}")
     try:
-        prompt = selected_template.format(
-            context=context,
-            question=question,
-            history=history_text,
-            format_mode=format_mode
-        )
-        logging.debug(f"Formatted Prompt snippet: {prompt[:300]}...")
-    except KeyError as e:
-        logging.error(f"❌ Prompt formatting error: Missing key {e} in template '{template_name}'", exc_info=True)
-        return {"error": f"內部錯誤：格式化提示詞時缺少必要資訊 {e}"}
+        prompt = selected_template.format(context=context, question=question, history=history_text, format_mode=format_mode)
     except Exception as e:
-        logging.error(f"❌ Unexpected prompt formatting error: {str(e)}", exc_info=True)
-        return {"error": f"內部錯誤：格式化提示詞時發生意外錯誤"}
+        logger.error(f"❌ Prompt formatting error for user {username}: {e}", exc_info=True)
+        return {"error": "內部錯誤：提示詞格式化失敗"}
 
-    # --- LLM Invocation & Post-processing ---
-    final_answer = None # 初始化最終答案
-    llm_attempts = 0
-    start_llm_total = time.time()
-
+    final_answer = None; llm_attempts = 0; start_llm_total = time.time()
     while llm_attempts <= MAX_LLM_RETRIES:
         try:
             start_llm_attempt = time.time()
-            logging.info(f"🧠 Calling LLM '{selected_model}' (Attempt {llm_attempts + 1}/{MAX_LLM_RETRIES + 1}, Style: {template_name})...")
-
-            # 調用 LLM
             raw_answer = llm.invoke(prompt)
-            llm_answer_stripped = raw_answer.strip() # 去除首尾空格
-
-            logging.info(f"LLM Raw Output (Attempt {llm_attempts + 1}, before post-processing): {llm_answer_stripped[:200]}...")
-
-            # <<< 調用後處理函數 >>>
-            processed_answer = post_process_answer(llm_answer_stripped)
-
-            logging.info(f"Final Answer (Attempt {llm_attempts + 1}, after post-processing): {processed_answer[:200]}...")
-
-            end_llm_attempt = time.time()
-            logging.info(f"⏱️ LLM response time (Attempt {llm_attempts + 1}): {end_llm_attempt - start_llm_attempt:.2f}s")
-
-            # 檢查處理後的答案是否為空或僅包含空格
-            if not processed_answer or processed_answer.isspace():
-                 logging.warning(f"⚠️ LLM Attempt {llm_attempts + 1} resulted in empty answer after processing.")
-                 # 可以選擇在這裡重試或拋出錯誤
-                 raise ValueError("LLM returned empty or whitespace-only answer after processing.")
-
-            final_answer = processed_answer # 將成功處理的結果賦值給最終答案
-
-            # === LLM 調用並處理成功，跳出重試迴圈 ===
-            break
-
+            processed_answer = post_process_answer(raw_answer.strip())
+            logger.info(f"⏱️ LLM response (Attempt {llm_attempts + 1}) for user {username}: {time.time() - start_llm_attempt:.2f}s")
+            if not processed_answer or processed_answer.isspace(): raise ValueError("LLM empty answer")
+            final_answer = processed_answer; break
         except Exception as e:
-            logging.error(f"❌ LLM invocation or processing error (Attempt {llm_attempts + 1}): {str(e)}", exc_info=True)
+            logger.error(f"❌ LLM error (Attempt {llm_attempts + 1}) for user {username}: {e}", exc_info=True)
             llm_attempts += 1
-            if llm_attempts <= MAX_LLM_RETRIES:
-                logging.info(f"🔄 Retrying LLM call ({llm_attempts}/{MAX_LLM_RETRIES + 1})...")
-                time.sleep(1) # 重試前稍等
+            if llm_attempts <= MAX_LLM_RETRIES: time.sleep(1)
             else:
-                logging.error(f"❌ LLM invocation failed after {MAX_LLM_RETRIES + 1} attempts.")
-                # 如果 final_answer 仍然是 None (即所有嘗試都失敗)，則返回錯誤
-                if final_answer is None:
-                    return {"error": f"LLM 回應錯誤或處理失敗，請稍後再試或更換模型。"}
-                # 如果之前的嘗試有結果 (雖然最後一次失敗了)，可以選擇返回那個結果
-                # 但這裡我們還是以最後一次失敗為準，返回錯誤
-                # return {"error": f"LLM 在最後一次嘗試中失敗，請稍後再試。"}
+                if final_answer is None: return {"error": "LLM 回應或處理失敗"}
+    if final_answer is None: return {"error": "無法從 LLM 獲取回應"}
 
+    current_chat_session_messages = _get_user_chat_messages(username, session_id)
+    current_chat_session_messages.append({"role": "user", "content": question})
+    current_chat_session_messages.append({"role": "assistant", "content": final_answer})
+    _save_user_chat_messages(username, session_id, current_chat_session_messages)
+    
+    user_chats_metadata = _load_user_chats_metadata(username)
+    if session_id in user_chats_metadata:
+        user_chats_metadata[session_id]["updated_at"] = datetime.now().isoformat()
+        _save_user_chats_metadata(username, user_chats_metadata)
+    logger.info(f"用戶 {username} 的聊天 {session_id} 記錄已更新並保存。")
 
-    end_llm_total = time.time()
-    logging.info(f"⏱️ Total LLM processing time (incl. retries): {end_llm_total - start_llm_total:.2f}s")
-
-    # --- 檢查最終是否有有效答案 ---
-    if final_answer is None:
-        logging.error("❌ No valid answer generated by LLM after all attempts.")
-        return {"error": "無法從語言模型獲取有效回應"}
-
-    # --- History Update ---
-    history.append((question, final_answer))
-    # chat_memory[session_id] = history # history 已經是 chat_memory[session_id] 的引用，不需要重新賦值
-    logging.info(f"Session {session_id} history updated.")
-
-    # --- QA Logging ---
     if SAVE_QA:
         try:
+            user_qa_log_dir = get_user_qa_log_path(username)
             today_str = datetime.now().strftime("%Y-%m-%d")
-            qa_filename = QA_LOG_PATH / f"qa_{today_str}.jsonl" # 改用 .jsonl 提高效率
+            qa_filename = user_qa_log_dir / f"qa_{today_str}.jsonl"
             qa_record = {
-                "session_id": session_id,
-                "timestamp": datetime.now().isoformat(),
-                "model": selected_model,
-                "prompt_mode": prompt_mode,
-                "format_mode": format_mode, # 記錄實際使用的 format_mode
-                "question": question,
-                "answer": final_answer,
-                "llm_attempts": llm_attempts + 1, # 記錄總嘗試次數
-                "template_used": template_name,
-                "retrieved_docs_count": len(docs) # 記錄檢索到的文檔數
+                "session_id": session_id, "timestamp": datetime.now().isoformat(),
+                "model": selected_model, "prompt_mode": prompt_mode, "format_mode": format_mode,
+                "question": question, "answer": final_answer, "llm_attempts": llm_attempts +1,
+                "template_used": template_name, "retrieved_docs_count": len(docs)
             }
-            # 使用 'a' 模式追加，避免讀取整個文件
-            with open(qa_filename, "a", encoding="utf-8") as f:
-                f.write(json.dumps(qa_record, ensure_ascii=False) + "\n")
-            logging.info(f"📝 QA record appended to {qa_filename}")
+            with open(qa_filename, "a", encoding="utf-8") as f: f.write(json.dumps(qa_record, ensure_ascii=False) + "\n")
         except Exception as e:
-            logging.error(f"❌ Failed to save QA record: {str(e)}", exc_info=True)
+            logger.error(f"❌ Failed to save QA record for user {username}: {e}", exc_info=True)
 
-    # --- Return Response ---
     total_time = time.time() - start_all
-    logging.info(f"⏱️ Total request processing time: {total_time:.2f}s")
-
+    logger.info(f"⏱️ Total request time for user {username}: {total_time:.2f}s")
     return {
-        "answer": final_answer, # 返回最終處理後的 answer
-        "model_used": selected_model,
-        "prompt_mode_used": prompt_mode,
-        "format_mode_used": format_mode,
+        "answer": final_answer, "model_used": selected_model,
+        "prompt_mode_used": prompt_mode, "format_mode_used": format_mode,
         "template_style_used": template_name
     }
 
-
 @app.post("/feedback")
-async def submit_feedback(feedback: FeedbackRequest):
-    """儲存使用者回饋"""
-    timestamp = datetime.now().isoformat()
-    # 確保核心欄位存在
+async def submit_feedback_for_user(feedback: FeedbackRequest, username: str = Depends(get_current_username)):
     if not feedback.user_expected_answer:
-        logging.warning("⚠️ Feedback submission missing expected answer.")
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="預期正確回答不能為空")
-
     record = {
-        # 使用者提供的理想問答對
-        "question": feedback.user_expected_question or feedback.question, # 如果沒提供預期問題，使用原始問題
+        "question": feedback.user_expected_question or feedback.question,
         "answer": feedback.user_expected_answer,
-        # 原始互動的元數據
         "metadata": {
-            "source": "manual_feedback",
-            "original_question": feedback.question,
-            "original_answer": feedback.original_answer,
-            "session_id": feedback.session_id,
-            "model_used": feedback.model,
-            "timestamp": timestamp
+            "source": "manual_feedback", "original_question": feedback.question,
+            "original_answer": feedback.original_answer, "session_id": feedback.session_id,
+            "model_used": feedback.model, "timestamp": datetime.now().isoformat()
         }
     }
     try:
-        # 使用更具描述性的文件名
+        user_feedback_dir = get_user_feedback_save_path(username)
         ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = FEEDBACK_SAVE_PATH / f"feedback_{feedback.session_id}_{ts_str}.json"
+        filename = user_feedback_dir / f"feedback_{feedback.session_id}_{ts_str}.json"
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(record, f, ensure_ascii=False, indent=2)
-        logging.info(f"📝 Feedback saved successfully to {filename}")
+        logger.info(f"📝 用戶 {username} 的回饋已保存到 {filename}")
         return {"message": "✅ 使用者回饋已儲存", "filename": str(filename)}
     except Exception as e:
-        logging.error(f"❌ Saving feedback failed: {str(e)}", exc_info=True)
-        from fastapi.responses import JSONResponse
-        # 返回 500 Internal Server Error
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"儲存回饋失敗，請聯繫管理員。"}
-        )
+        logger.error(f"❌ 保存用戶 {username} 的回饋失敗: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="儲存回饋失敗")
 
+app.include_router(api_router)
 
-
-
-# Command to run using uvicorn (recommended for production):
-# uvicorn hugging5_1:app --host 0.0.0.0 --port 8000 --workers 1
-# 主要模型5/5
+# Command to run:
+# uvicorn 5_10test:app --host 0.0.0.0 --port 8000 --reload 
+# 目前最主要程式碼
