@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from fastapi import FastAPI, Body, Depends, Request, HTTPException, APIRouter, Header
-from pydantic import BaseModel
+from pydantic import BaseModel, Field # <--- MODIFIED: Added Field
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -19,13 +19,85 @@ from functools import lru_cache
 import random
 import re
 import shutil # For deleting user directories
+from fastapi import Security, status
+from fastapi.security import APIKeyHeader
+
+# --- API Key Configuration ---
+API_KEY_NAME = "X-API-Key"
+api_key_header_auth = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+VALID_API_KEYS = {
+    "your-super-secret-api-key-1": "api_consumer_alpha",
+    "another-very-secure-key-for-beta": "api_consumer_beta",
+    "pxyuxXUMG3m7SdzShMIBG8mVEerE0LakY5YEapG84H4": "kmu_image_team",
+    "7mEwt6uLnaiqmTq5af3aPvrGYDIZ2oCdp59UiiNh3yw": "kmu_image_team",
+    "o03xq_jku1cerv-LeV21MB7wL4QArmEGim2TGQhUcuI": "kmu_image_team",
+    "wBT6XJiN1l5Vhc2Tx_d8r41sAFMsEgw-efCO6Y_fvKg": "kmu_image_team",
+
+}
+
+# --- Logging Configuration (before get_api_key_user so logger is defined) ---
+log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__) # Moved logger definition up
+# logger.info(f"日誌級別設定為: {log_level}") # Will be logged after app starts if moved in startup
+
+
+async def get_api_key_user(api_key: str = Security(api_key_header_auth)):
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authenticated: X-API-Key header missing."
+        )
+    if api_key in VALID_API_KEYS:
+        user_identifier = VALID_API_KEYS[api_key]
+        logger.info(f"API Key validated for user: {user_identifier}")
+
+        user_data_dir = get_user_chat_data_dir(user_identifier)
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+        (user_data_dir / "chat_messages").mkdir(parents=True, exist_ok=True)
+
+        user_feedback_dir = get_user_feedback_save_path(user_identifier)
+        user_feedback_dir.mkdir(parents=True, exist_ok=True)
+
+        user_qa_dir = get_user_qa_log_path(user_identifier)
+        user_qa_dir.mkdir(parents=True, exist_ok=True)
+
+        return user_identifier
+    else:
+        logger.warning(f"Invalid API Key received: {api_key[:10]}...")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Could not validate credentials: Invalid API Key."
+        )
 
 # ✅ FastAPI 初始化
-app = FastAPI()
-api_router = APIRouter(prefix="/api")
+# app = FastAPI() # <--- MODIFIED: Will initialize with more details later
+# --- MODIFIED: Initialize FastAPI app with metadata for docs ---
+app = FastAPI(
+    title="KMU Air Pollution RAG API",
+    description="""
+Welcome to the KMU Air Pollution Retrieval Augmented Generation (RAG) System API.
+This API allows you to interact with our RAG system to get answers about air pollution topics
+based on our knowledge base.
 
+**Authentication:**
+To use the public API endpoints (prefixed with `/api/v1/public`), you need an API Key.
+Please include this key in the `X-API-Key` header of your requests.
+If you need an API Key, please contact the system administrator.
 
-# ✅ 判斷使用者是否有指定格式需求
+**Session Management:**
+For multi-turn conversations, the API will return a `session_id` in the response.
+Include this `session_id` in subsequent requests to maintain context.
+If no `session_id` is provided in a request, a new session will be initiated for the API user.
+
+**Note:** The system is currently in testing and may experience instability. Please review output results carefully.
+    """,
+    version="1.0.0"
+)
+api_router = APIRouter(prefix="/api") # This is for your existing chat list etc.
+
+# ✅ 判斷使用者是否有指定格式需求 (Original - Unchanged)
 def detect_format_mode(question: str) -> str:
     format_triggers = [
         "請用一段話", "摘要", "表格", "表列", "條列式", "清單形式", "一句話", "說明就好",
@@ -35,30 +107,30 @@ def detect_format_mode(question: str) -> str:
          return "custom"
     return "default"
 
-# --- Middleware Setup ---
+# --- Middleware Setup (Original - Unchanged) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*", "X-Username"],
+    allow_headers=["*", "X-Username", "X-API-Key"], # <--- MODIFIED: Added X-API-Key to allowed headers
 )
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=["*"]
 )
 
-# --- Logging Configuration ---
-log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-logger.info(f"日誌級別設定為: {log_level}")
+# --- Logging Configuration (Original - logger already defined above) ---
+# log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+# logging.basicConfig(level=log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+# logger = logging.getLogger(__name__)
+# logger.info(f"日誌級別設定為: {log_level}")
 
 
-# --- Global Variables & Constants ---
+# --- Global Variables & Constants (Original - Unchanged) ---
 MAX_HISTORY_PER_SESSION = 10
 device = "cuda" if torch.cuda.is_available() else "cpu"
-logger.info(f"使用設備: {device}")
+# logger.info(f"使用設備: {device}") # Logged in startup
 
 embedding = None
 vectordb = None
@@ -71,6 +143,7 @@ MAX_LLM_RETRIES = 1
 
 USER_DATA_BASE_DIR = Path("user_specific_chat_data")
 
+# --- Utility Functions for User Data (Original - Unchanged) ---
 def sanitize_username(username: str) -> str:
     if not username:
         return "default_user"
@@ -93,7 +166,6 @@ def get_user_qa_log_path(username: str) -> Path:
     return QA_LOG_PATH_BASE / sanitize_username(username)
 
 async def get_current_username(x_username: Optional[str] = Header(None)) -> str:
-    # 如果 x_username 沒有在 header 中提供，FastAPI 會因為 Header(None) 將其設為 None
     if x_username is None:
         logger.warning("請求中未找到 X-Username Header")
         raise HTTPException(status_code=400, detail="請求標頭中缺少 X-Username")
@@ -103,7 +175,6 @@ async def get_current_username(x_username: Optional[str] = Header(None)) -> str:
         logger.warning(f"提供的用戶名 '{x_username}' 清理後無效")
         raise HTTPException(status_code=400, detail="提供的用戶名無效")
     
-    # ... (後續的目錄創建和返回邏輯不變) ...
     user_data_dir = get_user_chat_data_dir(sanitized)
     user_data_dir.mkdir(parents=True, exist_ok=True)
     (user_data_dir / "chat_messages").mkdir(parents=True, exist_ok=True)
@@ -116,16 +187,17 @@ async def get_current_username(x_username: Optional[str] = Header(None)) -> str:
 
     return sanitized
 
+# --- Embedding and VectorDB Loading (Original - Unchanged) ---
 try:
     embedding_model_name = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-m3")
-    logger.info(f"正在載入嵌入模型: {embedding_model_name}")
+    # logger.info(f"正在載入嵌入模型: {embedding_model_name}") # Logged in startup
     embedding = HuggingFaceEmbeddings(
         model_name=embedding_model_name,
         model_kwargs={"device": device},
         encode_kwargs={"normalize_embeddings": True}
     )
     _ = embedding.embed_query("測試嵌入模型")
-    logger.info("✅ 嵌入模型載入並測試成功")
+    # logger.info("✅ 嵌入模型載入並測試成功") # Logged in startup
 except Exception as e:
     logger.error(f"❌ 嵌入模型載入失敗: {str(e)}", exc_info=True)
     embedding = None
@@ -133,9 +205,14 @@ except Exception as e:
 @app.on_event("startup")
 def startup_event():
     global vectordb
+    logger.info(f"日誌級別設定為: {log_level}")
+    logger.info(f"使用設備: {device}")
+
     if embedding is None:
         logger.error("❌ 嵌入模型未載入，無法初始化向量資料庫。")
     else:
+        logger.info(f"正在載入嵌入模型: {embedding_model_name}")
+        logger.info("✅ 嵌入模型載入並測試成功")
         try:
             persist_dir = os.environ.get("VECTORDB_PATH", "5_10test")
             logger.info(f"正在從 '{persist_dir}' 載入向量資料庫...")
@@ -152,9 +229,9 @@ def startup_event():
     USER_DATA_BASE_DIR.mkdir(parents=True, exist_ok=True)
     FEEDBACK_SAVE_PATH_BASE.mkdir(parents=True, exist_ok=True)
     QA_LOG_PATH_BASE.mkdir(parents=True, exist_ok=True)
-    logger.info(f"用戶特定數據的基礎目錄已準備就緒: {USER_DATA_BASE_DIR}")
+    logger.info(f"用戶特定數據的基礎目錄已準備就緒: {USER_DATA_BASE_DIR}, {FEEDBACK_SAVE_PATH_BASE}, {QA_LOG_PATH_BASE}")
 
-# --- Prompt Templates ---
+# --- Prompt Templates (Original - Unchanged, assuming they are correct) ---
 STRUCTURED_LIST_PROMPT = PromptTemplate(
     input_variables=["question", "context", "history", "format_mode"],
     template="""
@@ -207,7 +284,6 @@ You are a helpful assistant providing clear and structured information in **Trad
 .................................................................................................................................................................
 """
 )
-
 HIERARCHICAL_BULLETS_PROMPT = PromptTemplate(
     input_variables=["question", "context", "history", "format_mode"],
     template="""
@@ -300,7 +376,6 @@ You are a helpful assistant tasked with providing detailed, hierarchically struc
 *(Note: The example output deliberately excludes concluding summaries or questions.)*
 """
 )
-
 PARAGRAPH_EMOJI_LEAD_PROMPT = PromptTemplate(
     input_variables=["question", "context", "history", "format_mode"],
     template="""
@@ -338,7 +413,6 @@ You are a helpful assistant providing clear, paragraph-based explanations in **T
 ✅ 總之，USR計畫透過與醫療機構的合作，從多個層面推動社區健康促進工作，確保了居民能夠獲得全面且有效的健康管理服務。
 """
 )
-
 CUSTOM_FORMAT_BASE_PROMPT = PromptTemplate(
     input_variables=["question", "context", "history", "format_mode"],
     template="""
@@ -365,7 +439,6 @@ You are a helpful assistant providing information in **Traditional Chinese**. Th
 👇 **請用繁體中文回答。絕對優先遵循使用者問題中的格式要求。若無明確要求，則以標準段落回答。請確保 Markdown 語法使用正確。**
 """
 )
-
 RESEARCH_PROMPT_TEMPLATE = PromptTemplate(
     input_variables=["question", "context", "history", "format_mode"],
     template="""
@@ -442,14 +515,13 @@ You are a policy analyst and academic writer providing an evaluation in **Tradit
 高雄小港的空污改善歷程是台灣工業區環境治理的縮影。持續落實「科技導向 + 公民參與 + 法制改革」三位一體的策略，將是未來提升空品與健康福祉的關鍵方向。
 """
 )
-
 DEFAULT_PROMPT_OPTIONS = [
     STRUCTURED_LIST_PROMPT,
     HIERARCHICAL_BULLETS_PROMPT,
     PARAGRAPH_EMOJI_LEAD_PROMPT
 ]
 
-# --- LLM Configuration and Loading ---
+# --- LLM Configuration and Loading (Original - Unchanged) ---
 common_llm_config = { "temperature": 0.1, "top_p": 0.8 }
 SUPPORTED_MODELS = [
     "qwen2.5:14b", "gemma3:12b", "gemma3:12b-it-q4_K_M", "qwen2.5:14b-instruct-q5_K_M",
@@ -464,30 +536,33 @@ def get_model(model_name: str) -> Optional[OllamaLLM]:
     try:
         logger.info(f"⏳ 正在載入或獲取緩存的模型: {model_name}...")
         model = OllamaLLM(model=model_name, **common_llm_config, request_timeout=300.0)
-        _ = model.invoke("請做個自我介紹")
+        _ = model.invoke("請做個自我介紹") # Test invocation
         logger.info(f"✅ 模型 {model_name} 載入並測試成功")
         return model
     except Exception as e:
         logger.error(f"❌ 載入或測試模型 {model_name} 失敗: {str(e)}", exc_info=True)
         return None
 
+# --- Rate Limiting Middleware (Original - Unchanged) ---
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    if "/chat" not in str(request.url):
-        return await call_next(request)
-    client_ip = request.client.host if request.client else "unknown"
-    current_time = time.time()
-    request_timestamps = request_counters.get(client_ip, [])
-    valid_timestamps = [t for t in request_timestamps if current_time - t < 60]
-    rate_limit_count = 30
-    if len(valid_timestamps) >= rate_limit_count:
-        logger.warning(f"🚦 速率限制觸發: IP {client_ip}")
-        from fastapi.responses import JSONResponse
-        return JSONResponse(status_code=429, content={"error": "請求過於頻繁"})
-    valid_timestamps.append(current_time)
-    request_counters[client_ip] = valid_timestamps
+    # Apply rate limiting to both /chat and new public API path
+    if "/chat" in str(request.url) or "/api/v1/public/rag/ask" in str(request.url): # <--- MODIFIED: Added public API path
+        client_ip = request.client.host if request.client else "unknown"
+        current_time = time.time()
+        request_timestamps = request_counters.get(client_ip, [])
+        valid_timestamps = [t for t in request_timestamps if current_time - t < 60] # 60 seconds window
+        rate_limit_count = 30 # 30 requests per minute per IP
+        if len(valid_timestamps) >= rate_limit_count:
+            logger.warning(f"🚦 速率限制觸發: IP {client_ip} for URL {request.url}")
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=429, content={"error": "請求過於頻繁"})
+        valid_timestamps.append(current_time)
+        request_counters[client_ip] = valid_timestamps
     return await call_next(request)
 
+
+# --- Pydantic Models for existing frontend (Original - Unchanged) ---
 class ChatRequest(BaseModel):
     session_id: str
     question: str
@@ -518,6 +593,7 @@ class Message(BaseModel):
     role: str
     content: str
 
+# --- Utility functions for chat data storage (Original - Unchanged) ---
 def _load_user_chats_metadata(username: str) -> Dict[str, Dict[str, str]]:
     metadata_file = get_user_chats_metadata_file(username)
     if metadata_file.exists():
@@ -531,7 +607,8 @@ def _load_user_chats_metadata(username: str) -> Dict[str, Dict[str, str]]:
 def _save_user_chats_metadata(username: str, metadata: Dict[str, Dict[str, str]]):
     metadata_file = get_user_chats_metadata_file(username)
     try:
-        sorted_metadata = dict(sorted(metadata.items(), key=lambda item: item[1].get('updated_at', ''), reverse=True))
+        # Sort by updated_at descending before saving
+        sorted_metadata = dict(sorted(metadata.items(), key=lambda item: item[1].get('updated_at', '1970-01-01T00:00:00Z'), reverse=True))
         with open(metadata_file, "w", encoding="utf-8") as f:
             json.dump(sorted_metadata, f, ensure_ascii=False, indent=2)
         logger.debug(f"用戶 {username} 的聊天元數據已保存到 {metadata_file}")
@@ -557,102 +634,44 @@ def _save_user_chat_messages(username: str, chat_id: str, messages: List[Dict[st
     except Exception as e:
         logger.error(f"❌ 保存用戶 {username} 聊天 {chat_id} 的訊息失敗: {e}", exc_info=True)
 
-
+# --- Post Processing Function (Original - Unchanged) ---
 def post_process_answer(answer: str) -> str:
     original_answer = answer
     try:
-        # 1. 移除開頭多餘片語
         patterns = [
-            r"^\s*根據提供的文本[,，]?\s*",
-            r"^\s*文本指出[,，]?\s*",
-            r"^\s*文本未(?:直接)?提及(?:，|,)但可以推斷[,，]?\s*",
-            r"^\s*以下將.*?格式呈現：?\s*",
-            r"^\s*這份文件提到(?:了)?\s*",
-            r"^\s*好的[,，]?\s*",
-            r"^\s*是的[,，]?\s*",
-            r"^\s*Here is the.*?you requested[:.]?\s*",
-        ]
-        for p in patterns:
-            answer = re.sub(p, "", answer, count=1, flags=re.IGNORECASE|re.MULTILINE).lstrip()
-
-        # 2. 自訂替換範例（保留）
+            r"^\s*根據提供的文本[,，]?\s*",r"^\s*文本指出[,，]?\s*",
+            r"^\s*文本未(?:直接)?提及(?:，|,)但可以推斷[,，]?\s*", r"^\s*以下將.*?格式呈現：?\s*",
+            r"^\s*這份文件提到(?:了)?\s*", r"^\s*好的[,，]?\s*", r"^\s*是的[,，]?\s*",
+            r"^\s*Here is the.*?you requested[:.]?\s*",]
+        for p in patterns: answer = re.sub(p, "", answer, count=1, flags=re.IGNORECASE|re.MULTILINE).lstrip()
         def replace_lack(m): return "執法機制的有效性是影響改善速度的關鍵因素。"
-        answer = re.sub(
-            r"(\n\s*|\A\s*)(缺乏嚴格的執法機制.*?)(?:\s*。|\s*\n|\s*$)",
-            lambda m: m.group(1) + replace_lack(m),
-            answer, flags=re.MULTILINE
-        )
-        answer = re.sub(
-            r"(\n\s*|\A\s*)(這可能涉及.*?(?:。|\n|$))",
-            r"\1", answer, flags=re.MULTILINE
-        )
-
-        # 3. 移除不想要的短語
-        to_remove = [
-            "(文本未直接提及，但可推測)",
-            "文章多次提及", "文章提及",
-            "文本提及", "根據文本",
-            "文件提及", "根據文件",
-            "可推論", "但可推論"
-        ]
-        for ph in to_remove:
-            answer = answer.replace(ph, "")
-
-        # 4. 簡化空白與標點間距
+        answer = re.sub(r"(\n\s*|\A\s*)(缺乏嚴格的執法機制.*?)(?:\s*。|\s*\n|\s*$)", lambda m: m.group(1) + replace_lack(m), answer, flags=re.MULTILINE)
+        answer = re.sub(r"(\n\s*|\A\s*)(這可能涉及.*?(?:。|\n|$))", r"\1", answer, flags=re.MULTILINE)
+        to_remove = ["(文本未直接提及，但可推測)","文章多次提及", "文章提及","文本提及", "根據文本","文件提及", "根據文件","可推論", "但可推論"]
+        for ph in to_remove: answer = answer.replace(ph, "")
         answer = re.sub(r'[ \t]{2,}', ' ', answer)
         answer = re.sub(r'\s+([,.:;!?，。：；！？])', r'\1', answer)
         answer = re.sub(r'([,.:;!?，。：；！？])([^\s,.:;!?，。：；！？\n])', r'\1 \2', answer)
         answer = re.sub(r'^\s*[,，：:]\s*', '', answer).strip()
-
-        # 5. 移除系統標記
-        markers = [
-            "📘 Conversation History:", "📄 Retrieved Context:",
-            "❓ User Question:", "👇 Please write your answer",
-            "📝 EXAMPLE OUTPUT FORMAT", "You are a helpful assistant",
-            "You are a policy analyst"
-        ]
+        markers = ["📘 Conversation History:", "📄 Retrieved Context:","❓ User Question:", "👇 Please write your answer","📝 EXAMPLE OUTPUT FORMAT", "You are a helpful assistant","You are a policy analyst"]
         for m in markers:
-            if m in answer:
-                answer = answer.split(m, 1)[0].strip()
-
-        # 6. 統一列表符號：將行首 * 或 -（有無空格）都改為 • 
+            if m in answer: answer = answer.split(m, 1)[0].strip()
         answer = re.sub(r'(?m)^\s*[\*\-]\s*', '• ', answer)
-
-        # 7a. 只針對「• *一、…」這種情況，移除「• 」後面單一星號
-        answer = re.sub(
-            r'(?m)^(•\s*)\*(?=[一二三四五六七八九十]+、)',
-            r'\1',
-            answer
-        )
-        # 7b. 同時移除行尾多餘的單一星號（如果有），例如「• 一、標題*」
-        answer = re.sub(
-            r'(?m)^(•.*?)[*]+\s*$',
-            r'\1',
-            answer
-        )
-
-        # 8. 處理多重星號與標題標記（保留既有邏輯）
+        answer = re.sub(r'(?m)^(•\s*)\*(?=[一二三四五六七八九十]+、)',r'\1',answer)
+        answer = re.sub(r'(?m)^(•.*?)[*]+\s*$',r'\1',answer)
         answer = re.sub(r'\*{3,}', '**', answer)
         answer = answer.replace('** ', '**').replace(' **', '**')
         answer = re.sub(r'(?m)^###\s+(.*?)\s*$', r'<h3>\1</h3>', answer)
         answer = re.sub(r'(?m)^##\s+(.*?)\s*$', r'<h2>\1</h2>', answer)
         answer = re.sub(r'(?m)^#\s+(.*?)\s*$', r'<h1>\1</h1>', answer)
         answer = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', answer)
-
-        # 9. 清理多餘換行
         answer = re.sub(r'\n{3,}', '\n\n', answer).strip()
-
-        # 10. 若結果為空，回傳原始
         return answer or original_answer
-
     except Exception as e:
         logger.error(f"❌ Post-processing failed: {e}", exc_info=True)
         return original_answer
 
-
-
-
-
+# --- Existing API routes for frontend (Original - Unchanged) ---
 @api_router.get("/chats", response_model=List[ChatListItem])
 async def get_chat_list_for_user(username: str = Depends(get_current_username)):
     user_chats_metadata = _load_user_chats_metadata(username)
@@ -660,6 +679,7 @@ async def get_chat_list_for_user(username: str = Depends(get_current_username)):
         ChatListItem(id=chat_id, title=meta.get("title", "無標題"), updated_at=meta.get("updated_at", ""))
         for chat_id, meta in user_chats_metadata.items()
     ]
+    # Already sorted by _save_user_chats_metadata, but defensive sort here is fine.
     chat_list.sort(key=lambda x: x.updated_at, reverse=True)
     return chat_list
 
@@ -674,15 +694,15 @@ async def create_new_chat_for_user(req: NewChatRequest, username: str = Depends(
     now_iso = datetime.now().isoformat()
     user_chats_metadata[chat_id] = {"title": title, "created_at": now_iso, "updated_at": now_iso}
     _save_user_chats_metadata(username, user_chats_metadata)
-    _save_user_chat_messages(username, chat_id, [])
+    _save_user_chat_messages(username, chat_id, []) # Create empty messages file
     logger.info(f"✅ 用戶 {username} 的新聊天已創建: ID={chat_id}, Title='{title}'")
     return ChatListItem(id=chat_id, title=title, updated_at=now_iso)
 
 @api_router.get("/chats/{chat_id}/messages", response_model=List[Message])
 async def get_chat_messages_for_user(chat_id: str, username: str = Depends(get_current_username)):
-    user_chats_metadata = _load_user_chats_metadata(username)
+    user_chats_metadata = _load_user_chats_metadata(username) # Check if chat_id belongs to user
     if chat_id not in user_chats_metadata:
-        logger.warning(f"用戶 {username} 請求不存在的聊天 {chat_id} 的訊息。")
+        logger.warning(f"用戶 {username} 請求不存在或不屬於他的聊天 {chat_id} 的訊息。")
         raise HTTPException(status_code=404, detail=f"聊天 ID {chat_id} 未找到")
 
     messages = _get_user_chat_messages(username, chat_id)
@@ -700,7 +720,7 @@ async def rename_chat_for_user(chat_id: str, req: RenameChatRequest, username: s
     
     now_iso = datetime.now().isoformat()
     user_chats_metadata[chat_id]["title"] = new_title
-    user_chats_metadata[chat_id]["updated_at"] = now_iso
+    user_chats_metadata[chat_id]["updated_at"] = now_iso # Update timestamp on rename
     _save_user_chats_metadata(username, user_chats_metadata)
     logger.info(f"✅ 用戶 {username} 的聊天已重命名: ID={chat_id}, New Title='{new_title}'")
     return ChatListItem(id=chat_id, title=new_title, updated_at=now_iso)
@@ -721,45 +741,54 @@ async def delete_chat_for_user(chat_id: str, username: str = Depends(get_current
             logger.info(f"用戶 {username} 的聊天訊息文件 {message_file} 已刪除。")
         except Exception as e:
             logger.error(f"❌ 刪除用戶 {username} 的聊天訊息文件 {message_file} 失敗: {e}", exc_info=True)
+            # Potentially raise HTTPException if critical, or just log
     
     logger.info(f"🗑️ 用戶 {username} 的聊天已刪除: ID={chat_id}")
-    if not user_chats_metadata:
-        user_chat_dir = get_user_chat_data_dir(username)
+    # Logic to delete user directory if no chats remain
+    if not user_chats_metadata: # Check if metadata is now empty
+        user_chat_data_d = get_user_chat_data_dir(username)
+        user_chat_messages_d = get_user_chat_messages_dir(username)
         try:
-            messages_dir = get_user_chat_messages_dir(username)
-            if not any(messages_dir.iterdir()):
-                shutil.rmtree(user_chat_dir)
-                logger.info(f"用戶 {username} 的數據目錄 {user_chat_dir} 因無聊天記錄而被刪除。")
+            # Check if messages directory is also empty
+            if user_chat_messages_d.exists() and not any(user_chat_messages_d.iterdir()):
+                shutil.rmtree(user_chat_data_d) # Remove entire user_specific_chat_data/username dir
+                logger.info(f"用戶 {username} 的數據目錄 {user_chat_data_d} 因無聊天記錄而被刪除。")
         except Exception as e:
-            logger.error(f"❌ 刪除空的用戶 {username} 數據目錄 {user_chat_dir} 失敗: {e}", exc_info=True)
+            logger.error(f"❌ 刪除空的用戶 {username} 數據目錄 {user_chat_data_d} 失敗: {e}", exc_info=True)
     return None
 
-@app.post("/chat")
-async def chat(req: ChatRequest, username: str = Depends(get_current_username)):
-    start_all = time.time()
-    session_id = req.session_id
-    question = req.question.strip()
-    selected_model = req.model if req.model in SUPPORTED_MODELS else DEFAULT_MODEL
-    prompt_mode = req.prompt_mode if req.prompt_mode in ["default", "research"] else "default"
+
+# --- MODIFIED: Extracted Core RAG Processing Logic ---
+class PublicRAGDocumentSource(BaseModel): # Define here for process_rag_request return type hint
+    content: str
+    metadata: Dict
+
+async def process_rag_request(
+    username: str,
+    session_id: str,
+    question: str,
+    selected_model: str,
+    prompt_mode: str,
+) -> Dict: # Return type is Dict, will be wrapped by Pydantic model later
+    start_all_processing = time.time()
 
     if not question:
-        logger.warning(f"⚠️ 用戶 {username} 收到空問題。")
-        return {"error": "問題不能為空"}
+        logger.warning(f"⚠️ 用戶 {username} (via {'API' if username.startswith('api_consumer_') else 'Frontend'}) 收到空問題。")
+        raise HTTPException(status_code=400, detail="問題不能為空 (Question cannot be empty).")
 
     llm = get_model(selected_model)
-    if llm is None: return {"error": f"無法載入語言模型 '{selected_model}'"}
+    if llm is None:
+        logger.error(f"❌ RAG process error for user {username}: LLM '{selected_model}' not loaded.")
+        raise HTTPException(status_code=500, detail=f"無法載入語言模型 (Could not load language model) '{selected_model}'.")
     if vectordb is None:
-        logger.error(f"❌ /chat error for user {username}: Vector database not available.")
-        return {"error": "向量資料庫不可用"}
+        logger.error(f"❌ RAG process error for user {username}: Vector database not available.")
+        raise HTTPException(status_code=500, detail="向量資料庫不可用 (Vector database not available).")
 
     user_chats_metadata = _load_user_chats_metadata(username)
     if session_id not in user_chats_metadata:
         now_iso = datetime.now().isoformat()
-        default_title = f"對話 {session_id[:8]}"
-        if question:
-            first_message_title = question[:30] + "..." if len(question) > 30 else question
-            default_title = first_message_title
-
+        default_title = question[:30].strip() + "..." if len(question) > 30 else question.strip()
+        if not default_title: default_title = f"對話 {session_id[:8]}"
         user_chats_metadata[session_id] = {"title": default_title, "created_at": now_iso, "updated_at": now_iso}
         _save_user_chats_metadata(username, user_chats_metadata)
         _save_user_chat_messages(username, session_id, [])
@@ -767,13 +796,13 @@ async def chat(req: ChatRequest, username: str = Depends(get_current_username)):
 
     detected_format_mode = detect_format_mode(question)
     format_mode = detected_format_mode
-    logger.info(f"🚀 Request - User: {username}, ChatID: {session_id}, Model: {selected_model}, PromptMode: {prompt_mode}, FormatMode: {format_mode}")
-    logger.info(f"❓ Question: {question}")
+    logger.info(f"🚀 Processing RAG - User: {username}, SessionID: {session_id}, Model: {selected_model}, PromptMode: {prompt_mode}, FormatMode: {format_mode}")
+    logger.info(f"❓ Question for {username}: {question}")
 
-    messages_for_prompt = _get_user_chat_messages(username, session_id)
+    messages_for_prompt_history = _get_user_chat_messages(username, session_id)
     history_pairs = []
     temp_user_q = None
-    for msg_dict in messages_for_prompt:
+    for msg_dict in messages_for_prompt_history:
         if msg_dict["role"] == "user": temp_user_q = msg_dict["content"]
         elif msg_dict["role"] == "assistant" and temp_user_q:
             history_pairs.append((temp_user_q, msg_dict["content"]))
@@ -781,89 +810,161 @@ async def chat(req: ChatRequest, username: str = Depends(get_current_username)):
     history_text = "\n".join([f"使用者: {q}\n助理: {a}" for q, a in history_pairs[-MAX_HISTORY_PER_SESSION:]]) if history_pairs else "無歷史對話紀錄。"
 
     start_retrieve = time.time()
-    retriever_k = 20; retriever_fetch_k = 50; retriever_lambda_mult = 0.8
-    retriever = vectordb.as_retriever(search_type="mmr", search_kwargs={"k": retriever_k, "fetch_k": retriever_fetch_k, "lambda_mult": retriever_lambda_mult})
-    context = ""; docs = []
+
+    #mmr
+    #retriever_k = 20; retriever_fetch_k = 50; retriever_lambda_mult = 0.8
+    #retriever = vectordb.as_retriever(search_type="mmr", search_kwargs={"k": retriever_k, "fetch_k": retriever_fetch_k, "lambda_mult": retriever_lambda_mult})
+    retriever_k = 20
+    retriever = vectordb.as_retriever(
+        search_type="similarity_score_threshold",
+        search_kwargs={"k": retriever_k, "score_threshold": 0.5}
+    )
+    retrieved_docs_list: List[Dict] = [] # For storing docs in a serializable way
+    context_str = "沒有找到相關的背景資料。"
     try:
-        docs = retriever.invoke(question)
-        if not docs: context = "沒有找到相關的背景資料。"
-        else: context = "\n\n".join([doc.page_content for doc in docs])
-        logger.info(f"⏱️ Retrieval time: {time.time() - start_retrieve:.2f}s, Found {len(docs)} docs.")
+        docs_langchain = retriever.invoke(question) # Langchain Document objects
+        if docs_langchain:
+            context_str = "\n\n".join([doc.page_content for doc in docs_langchain])
+            retrieved_docs_list = [{"content": doc.page_content, "metadata": doc.metadata} for doc in docs_langchain]
+        logger.info(f"⏱️ Retrieval time: {time.time() - start_retrieve:.2f}s, Found {len(docs_langchain)} docs for user {username}.")
     except Exception as e:
         logger.error(f"❌ Retrieval error for user {username}, q='{question}': {str(e)}", exc_info=True)
-        return {"error": f"向量資料庫檢索錯誤：{str(e)}"}
-    
-    selected_template = None; template_name = "N/A"
+        raise HTTPException(status_code=500, detail=f"向量資料庫檢索錯誤 (Vector database retrieval error): {str(e)}")
+
+    selected_template = None
+    template_name_for_log = "N/A"
     if prompt_mode == "research":
         selected_template = RESEARCH_PROMPT_TEMPLATE
-        template_name = f"Research ({'User Format' if format_mode == 'custom' else 'Default Format'})"
+        template_name_for_log = f"Research ({'User Format' if format_mode == 'custom' else 'Default Format'})"
     elif format_mode == "custom":
         selected_template = CUSTOM_FORMAT_BASE_PROMPT
-        template_name = "Custom Format Request"
+        template_name_for_log = "Custom Format Request"
     else:
         selected_template = random.choice(DEFAULT_PROMPT_OPTIONS)
-        if selected_template == STRUCTURED_LIST_PROMPT: template_name = "Default Style (Random: Structured List)"
-        elif selected_template == HIERARCHICAL_BULLETS_PROMPT: template_name = "Default Style (Random: Hierarchical Bullets)"
-        elif selected_template == PARAGRAPH_EMOJI_LEAD_PROMPT: template_name = "Default Style (Random: Paragraph Emoji Lead)"
-        else: template_name = "Default Style (Random: Unknown)"
-    logger.info(f"Using template for user {username}: {template_name}")
+        if selected_template == STRUCTURED_LIST_PROMPT: template_name_for_log = "Default Style (Random: Structured List)"
+        elif selected_template == HIERARCHICAL_BULLETS_PROMPT: template_name_for_log = "Default Style (Random: Hierarchical Bullets)"
+        elif selected_template == PARAGRAPH_EMOJI_LEAD_PROMPT: template_name_for_log = "Default Style (Random: Paragraph Emoji Lead)"
+        else: template_name_for_log = "Default Style (Random: Unknown)"
+    logger.info(f"Using template for user {username}: {template_name_for_log}")
+
     try:
-        prompt = selected_template.format(context=context, question=question, history=history_text, format_mode=format_mode)
+        prompt = selected_template.format(context=context_str, question=question, history=history_text, format_mode=format_mode)
     except Exception as e:
         logger.error(f"❌ Prompt formatting error for user {username}: {e}", exc_info=True)
-        return {"error": "內部錯誤：提示詞格式化失敗"}
+        raise HTTPException(status_code=500, detail="內部錯誤：提示詞格式化失敗 (Internal error: Prompt formatting failed).")
 
-    final_answer = None; llm_attempts = 0; start_llm_total = time.time()
-    while llm_attempts <= MAX_LLM_RETRIES:
+    final_answer = None
+    llm_actual_attempts = 0
+    start_llm_total_processing = time.time()
+    current_llm_retries_count = 0
+    while current_llm_retries_count <= MAX_LLM_RETRIES:
         try:
-            start_llm_attempt = time.time()
+            start_llm_one_attempt = time.time()
             raw_answer = llm.invoke(prompt)
             processed_answer = post_process_answer(raw_answer.strip())
-            logger.info(f"⏱️ LLM response (Attempt {llm_attempts + 1}) for user {username}: {time.time() - start_llm_attempt:.2f}s")
-            if not processed_answer or processed_answer.isspace(): raise ValueError("LLM empty answer")
-            final_answer = processed_answer; break
+            llm_actual_attempts = current_llm_retries_count + 1
+            logger.info(f"⏱️ LLM response (Attempt {llm_actual_attempts}) for user {username}: {time.time() - start_llm_one_attempt:.2f}s")
+            if not processed_answer or processed_answer.isspace():
+                raise ValueError("LLM returned empty or whitespace answer")
+            final_answer = processed_answer
+            break
         except Exception as e:
-            logger.error(f"❌ LLM error (Attempt {llm_attempts + 1}) for user {username}: {e}", exc_info=True)
-            llm_attempts += 1
-            if llm_attempts <= MAX_LLM_RETRIES: time.sleep(1)
-            else:
-                if final_answer is None: return {"error": "LLM 回應或處理失敗"}
-    if final_answer is None: return {"error": "無法從 LLM 獲取回應"}
+            logger.error(f"❌ LLM error (Attempt {current_llm_retries_count + 1}) for user {username}: {e}", exc_info=True)
+            current_llm_retries_count += 1
+            if current_llm_retries_count <= MAX_LLM_RETRIES:
+                time.sleep(1)
+        if final_answer: break
+
+    if final_answer is None:
+        logger.error(f"❌ Failed to get LLM response for user {username} after {MAX_LLM_RETRIES + 1} attempts.")
+        raise HTTPException(status_code=500, detail="LLM 回應或處理失敗 (LLM response or processing failed).")
 
     current_chat_session_messages = _get_user_chat_messages(username, session_id)
     current_chat_session_messages.append({"role": "user", "content": question})
     current_chat_session_messages.append({"role": "assistant", "content": final_answer})
     _save_user_chat_messages(username, session_id, current_chat_session_messages)
-    
-    user_chats_metadata = _load_user_chats_metadata(username)
-    if session_id in user_chats_metadata:
-        user_chats_metadata[session_id]["updated_at"] = datetime.now().isoformat()
-        _save_user_chats_metadata(username, user_chats_metadata)
+
+    user_chats_metadata_to_update = _load_user_chats_metadata(username)
+    if session_id in user_chats_metadata_to_update:
+        user_chats_metadata_to_update[session_id]["updated_at"] = datetime.now().isoformat()
+        _save_user_chats_metadata(username, user_chats_metadata_to_update)
     logger.info(f"用戶 {username} 的聊天 {session_id} 記錄已更新並保存。")
 
     if SAVE_QA:
         try:
             user_qa_log_dir = get_user_qa_log_path(username)
             today_str = datetime.now().strftime("%Y-%m-%d")
-            qa_filename = user_qa_log_dir / f"qa_{today_str}.jsonl"
+            qa_filename = user_qa_log_dir / f"qa_log_{today_str}.jsonl" # Changed filename slightly for clarity
             qa_record = {
-                "session_id": session_id, "timestamp": datetime.now().isoformat(),
+                "username_source_type": "api_call" if username.startswith("api_consumer_") else "frontend_user",
+                "user_identifier": username, "session_id": session_id, "timestamp": datetime.now().isoformat(),
                 "model": selected_model, "prompt_mode": prompt_mode, "format_mode": format_mode,
-                "question": question, "answer": final_answer, "llm_attempts": llm_attempts +1,
-                "template_used": template_name, "retrieved_docs_count": len(docs)
+                "question": question, "answer": final_answer, "llm_attempts": llm_actual_attempts,
+                "template_used": template_name_for_log, "retrieved_docs_count": len(docs_langchain if 'docs_langchain' in locals() else []),
+                "total_processing_time_seconds": round(time.time() - start_all_processing, 2)
             }
-            with open(qa_filename, "a", encoding="utf-8") as f: f.write(json.dumps(qa_record, ensure_ascii=False) + "\n")
+            with open(qa_filename, "a", encoding="utf-8") as f:
+                f.write(json.dumps(qa_record, ensure_ascii=False) + "\n")
         except Exception as e:
             logger.error(f"❌ Failed to save QA record for user {username}: {e}", exc_info=True)
+    
+    llm_total_time = time.time() - start_llm_total_processing
+    retrieval_total_time = (time.time() - start_retrieve) if 'start_retrieve' in locals() else 0
 
-    total_time = time.time() - start_all
-    logger.info(f"⏱️ Total request time for user {username}: {total_time:.2f}s")
     return {
-        "answer": final_answer, "model_used": selected_model,
-        "prompt_mode_used": prompt_mode, "format_mode_used": format_mode,
-        "template_style_used": template_name
+        "answer": final_answer,
+        "model_used": selected_model,
+        "prompt_mode_used": prompt_mode,
+        "format_mode_used": format_mode,
+        "template_style_used": template_name_for_log,
+        "sources": retrieved_docs_list, # Use the serializable list
+        "session_id": session_id,
+        "llm_processing_time_seconds": round(llm_total_time, 2),
+        "retrieval_time_seconds": round(retrieval_total_time, 2),
     }
 
+# --- MODIFIED: Original /chat endpoint now calls process_rag_request ---
+@app.post("/chat") # Original endpoint for your frontend
+async def chat(req: ChatRequest, username: str = Depends(get_current_username)):
+    start_overall_request = time.time()
+
+    session_id = req.session_id
+    question = req.question.strip()
+    selected_model = req.model if req.model in SUPPORTED_MODELS else DEFAULT_MODEL
+    prompt_mode = req.prompt_mode if req.prompt_mode in ["default", "research"] else "default"
+
+    try:
+        result_dict = await process_rag_request(
+            username=username,
+            session_id=session_id,
+            question=question,
+            selected_model=selected_model,
+            prompt_mode=prompt_mode
+        )
+
+        total_time = time.time() - start_overall_request
+        logger.info(f"⏱️ Total /chat request time for user {username}: {total_time:.2f}s. "
+                    f"LLM time: {result_dict.get('llm_processing_time_seconds', 'N/A')}s. "
+                    f"Retrieval time: {result_dict.get('retrieval_time_seconds', 'N/A')}s")
+        
+        # Frontend expects this specific format
+        return {
+            "answer": result_dict["answer"],
+            "model_used": result_dict["model_used"],
+            "prompt_mode_used": result_dict["prompt_mode_used"],
+            "format_mode_used": result_dict["format_mode_used"],
+            "template_style_used": result_dict["template_style_used"]
+        }
+    except HTTPException as e_http:
+        logger.error(f"HTTP Exception during /chat for user {username}: {e_http.detail}")
+        raise e_http # Re-raise if it's already an HTTPException (e.g., from process_rag_request)
+    except Exception as e_general:
+        logger.error(f"❌ Unexpected error in /chat for user {username}: {str(e_general)}", exc_info=True)
+        # Your original error response for /chat
+        return {"error": "LLM 回應或處理失敗或內部錯誤"}
+
+
+# --- Feedback endpoint (Original - Unchanged) ---
 @app.post("/feedback")
 async def submit_feedback_for_user(feedback: FeedbackRequest, username: str = Depends(get_current_username)):
     if not feedback.user_expected_answer:
@@ -874,12 +975,13 @@ async def submit_feedback_for_user(feedback: FeedbackRequest, username: str = De
         "metadata": {
             "source": "manual_feedback", "original_question": feedback.question,
             "original_answer": feedback.original_answer, "session_id": feedback.session_id,
-            "model_used": feedback.model, "timestamp": datetime.now().isoformat()
+            "model_used": feedback.model, "timestamp": datetime.now().isoformat(),
+            "user_identifier": username # Log who submitted
         }
     }
     try:
         user_feedback_dir = get_user_feedback_save_path(username)
-        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S%f") # Added microsecond for more uniqueness
         filename = user_feedback_dir / f"feedback_{feedback.session_id}_{ts_str}.json"
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(record, f, ensure_ascii=False, indent=2)
@@ -887,10 +989,87 @@ async def submit_feedback_for_user(feedback: FeedbackRequest, username: str = De
         return {"message": "✅ 使用者回饋已儲存", "filename": str(filename)}
     except Exception as e:
         logger.error(f"❌ 保存用戶 {username} 的回饋失敗: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="儲存回饋失敗")
+        raise HTTPException(status_code=500, detail="儲存回饋失敗 (Failed to save feedback).")
 
-app.include_router(api_router)
+# --- MODIFIED: New Pydantic models for Public API ---
+class PublicRAGRequest(BaseModel):
+    question: str = Field(..., min_length=1, description="User's question for the RAG system.")
+    session_id: Optional[str] = Field(None, description="Optional session ID for multi-turn conversations. If not provided, a new session will be initiated by the system based on API key.")
+    model: Optional[str] = Field(DEFAULT_MODEL, description=f"Optional LLM model to use. Supported: {', '.join(SUPPORTED_MODELS)}. Defaults to {DEFAULT_MODEL}.")
+    prompt_mode: Optional[str] = Field("default", description="Optional prompt mode. Supported: 'default', 'research'. Defaults to 'default'.")
+
+class PublicRAGResponse(BaseModel):
+    answer: str
+    model_used: str
+    prompt_mode_used: str
+    format_mode_used: str
+    template_style_used: Optional[str] = None
+    sources: List[PublicRAGDocumentSource] # Re-using the one defined above process_rag_request
+    session_id: str
+    llm_processing_time_seconds: Optional[float] = None
+    retrieval_time_seconds: Optional[float] = None
+    total_request_time_seconds: Optional[float] = None
+
+
+# --- MODIFIED: New Router and Endpoint for Public API ---
+public_api_v1_router = APIRouter(
+    prefix="/api/v1/public",
+    tags=["Public RAG API v1 (X-API-Key Auth)"] # Tag for Swagger UI grouping
+)
+
+@public_api_v1_router.post(
+    "/rag/ask",
+    response_model=PublicRAGResponse,
+    summary="Ask the RAG system (API Key)",
+    description="""
+    Send a question to the RAG system and receive an answer augmented with retrieved context.
+    Requires `X-API-Key` in the header for authentication.
+    Use the returned `session_id` for follow-up questions in the same conversation.
+    """
+)
+async def public_rag_ask(
+    req: PublicRAGRequest,
+    api_user_identifier: str = Depends(get_api_key_user) # Handles API key auth
+):
+    start_overall_request = time.time()
+
+    session_id_to_use = req.session_id
+    if not session_id_to_use:
+        # Generate a unique session ID for this API user if not provided
+        timestamp_ms = int(time.time() * 1000)
+        random_suffix = random.randint(10000, 99999)
+        session_id_to_use = f"api_{api_user_identifier.replace('_','-')[:10]}_{timestamp_ms}_{random_suffix}" # Ensure session_id is somewhat readable and unique
+        logger.info(f"No session_id provided by API user '{api_user_identifier}', generated: '{session_id_to_use}'")
+
+    try:
+        result_dict = await process_rag_request(
+            username=api_user_identifier, # API Key's associated identifier acts as username
+            session_id=session_id_to_use,
+            question=req.question,
+            selected_model=req.model,
+            prompt_mode=req.prompt_mode,
+        )
+
+        total_time = time.time() - start_overall_request
+        result_dict["total_request_time_seconds"] = round(total_time, 2)
+        
+        logger.info(f"⏱️ Total Public API request time for API user '{api_user_identifier}': {total_time:.2f}s. "
+                    f"LLM: {result_dict.get('llm_processing_time_seconds','N/A')}s. "
+                    f"Retrieval: {result_dict.get('retrieval_time_seconds','N/A')}s")
+
+        return PublicRAGResponse(**result_dict)
+
+    except HTTPException as e_http:
+        logger.error(f"HTTP Exception during Public API call for user '{api_user_identifier}': {e_http.detail}")
+        raise e_http
+    except Exception as e_general:
+        logger.error(f"❌ Unexpected error in public_rag_ask for API user '{api_user_identifier}': {str(e_general)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal server error occurred while processing your RAG request.")
+
+
+# --- MODIFIED: Include all routers in the app ---
+app.include_router(api_router) # For existing frontend-facing APIs (/api/chats, etc.)
+app.include_router(public_api_v1_router) # For new public API
 
 # Command to run:
-# uvicorn 5_10test:app --host 0.0.0.0 --port 8000 --reload 
-# 目前最主要程式碼
+# uvicorn 5_20test:app --host 0.0.0.0 --port 8000 --reload  #此為api的後端模型
