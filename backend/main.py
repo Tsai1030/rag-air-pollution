@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from fastapi import FastAPI, Body, Depends, Request, HTTPException, APIRouter, Header
-from pydantic import BaseModel, Field # <--- MODIFIED: Added Field
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -13,12 +13,12 @@ import json
 import os
 import torch
 from pathlib import Path
-from typing import Optional, List, Dict, Annotated # Annotated for Header
+from typing import Optional, List, Dict, Annotated
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from functools import lru_cache
 import random
 import re
-import shutil # For deleting user directories
+import shutil
 from fastapi import Security, status
 from fastapi.security import APIKeyHeader
 
@@ -33,15 +33,18 @@ VALID_API_KEYS = {
     "7mEwt6uLnaiqmTq5af3aPvrGYDIZ2oCdp59UiiNh3yw": "kmu_image_team",
     "o03xq_jku1cerv-LeV21MB7wL4QArmEGim2TGQhUcuI": "kmu_image_team",
     "wBT6XJiN1l5Vhc2Tx_d8r41sAFMsEgw-efCO6Y_fvKg": "kmu_image_team",
-
 }
 
-# --- Logging Configuration (before get_api_key_user so logger is defined) ---
+# --- Logging Configuration ---
 log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__) # Moved logger definition up
-# logger.info(f"日誌級別設定為: {log_level}") # Will be logged after app starts if moved in startup
+# Ensure log level is a valid level string for basicConfig
+valid_log_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+if log_level not in valid_log_levels:
+    print(f"Warning: Invalid LOG_LEVEL '{log_level}'. Defaulting to INFO.")
+    log_level = "INFO"
 
+logging.basicConfig(level=log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 async def get_api_key_user(api_key: str = Security(api_key_header_auth)):
     if not api_key:
@@ -52,17 +55,13 @@ async def get_api_key_user(api_key: str = Security(api_key_header_auth)):
     if api_key in VALID_API_KEYS:
         user_identifier = VALID_API_KEYS[api_key]
         logger.info(f"API Key validated for user: {user_identifier}")
-
         user_data_dir = get_user_chat_data_dir(user_identifier)
         user_data_dir.mkdir(parents=True, exist_ok=True)
         (user_data_dir / "chat_messages").mkdir(parents=True, exist_ok=True)
-
         user_feedback_dir = get_user_feedback_save_path(user_identifier)
         user_feedback_dir.mkdir(parents=True, exist_ok=True)
-
         user_qa_dir = get_user_qa_log_path(user_identifier)
         user_qa_dir.mkdir(parents=True, exist_ok=True)
-
         return user_identifier
     else:
         logger.warning(f"Invalid API Key received: {api_key[:10]}...")
@@ -71,9 +70,6 @@ async def get_api_key_user(api_key: str = Security(api_key_header_auth)):
             detail="Could not validate credentials: Invalid API Key."
         )
 
-# ✅ FastAPI 初始化
-# app = FastAPI() # <--- MODIFIED: Will initialize with more details later
-# --- MODIFIED: Initialize FastAPI app with metadata for docs ---
 app = FastAPI(
     title="KMU Air Pollution RAG API",
     description="""
@@ -95,119 +91,94 @@ If no `session_id` is provided in a request, a new session will be initiated for
     """,
     version="1.0.0"
 )
-api_router = APIRouter(prefix="/api") # This is for your existing chat list etc.
+api_router = APIRouter(prefix="/api")
 
-# ✅ 判斷使用者是否有指定格式需求 (Original - Unchanged)
 def detect_format_mode(question: str) -> str:
     format_triggers = [
         "請用一段話", "摘要", "表格", "表列", "條列式", "清單形式", "一句話", "說明就好",
-        "summarize", "as a table", "one paragraph", "bullet points", "list format"
+        "summarize", "as a table", "one paragraph", "bullet points", "list format",
+        "格式", "指定的格式", "指定格式", "以下格式", "下列格式", "這個格式", "這種格式",
+        "我要的格式", "請用格式", "請用以下", "用以下格式"
     ]
-    if any(re.search(r'\b' + re.escape(kw) + r'\b', question, re.IGNORECASE) for kw in format_triggers) or "簡單說明" in question:
-         return "custom"
+    if any(re.search(r'\b' + re.escape(kw) + r'\b', question, re.IGNORECASE) for kw in format_triggers):
+        logger.info(f"Format mode 'custom' triggered by keyword for question: '{question[:100]}'")
+        return "custom"
+    if re.search(r"(請用|使用|採用|依照|依據|照著|給我|我要).*格式", question, re.IGNORECASE):
+        logger.info(f"Format mode 'custom' triggered by explicit format instruction for question: '{question[:100]}'")
+        return "custom"
+    if re.search(r"Question\s*:", question, re.IGNORECASE) and \
+       re.search(r"Answers?\s*:", question, re.IGNORECASE) and \
+       ("格式" in question or "請用" in question or "幫我" in question or "給我" in question or "我要的是" in question):
+        logger.info(f"Format mode 'custom' triggered by 'Question:/Answers:' pattern with instructive verb for question: '{question[:100]}'")
+        return "custom"
+    if "簡單說明" in question:
+        logger.info(f"Format mode 'custom' triggered by '簡單說明' for question: '{question[:100]}'")
+        return "custom"
+    logger.info(f"Format mode 'default' for question: '{question[:100]}'")
     return "default"
 
-# --- Middleware Setup (Original - Unchanged) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*", "X-Username", "X-API-Key"], # <--- MODIFIED: Added X-API-Key to allowed headers
+    allow_headers=["*", "X-Username", "X-API-Key"],
 )
-app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=["*"]
-)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
 
-# --- Logging Configuration (Original - logger already defined above) ---
-# log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-# logging.basicConfig(level=log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-# logger = logging.getLogger(__name__)
-# logger.info(f"日誌級別設定為: {log_level}")
-
-
-# --- Global Variables & Constants (Original - Unchanged) ---
 MAX_HISTORY_PER_SESSION = 10
 device = "cuda" if torch.cuda.is_available() else "cpu"
-# logger.info(f"使用設備: {device}") # Logged in startup
-
 embedding = None
 vectordb = None
 request_counters = {}
-
 FEEDBACK_SAVE_PATH_BASE = Path("user_specific_feedback")
 QA_LOG_PATH_BASE = Path("user_specific_qa_logs")
 SAVE_QA = True
 MAX_LLM_RETRIES = 1
-
 USER_DATA_BASE_DIR = Path("user_specific_chat_data")
 
-# --- Utility Functions for User Data (Original - Unchanged) ---
 def sanitize_username(username: str) -> str:
-    if not username:
-        return "default_user"
+    if not username: return "default_user"
     sanitized = re.sub(r'[^a-zA-Z0-9_-]', '', username).lower()
     return sanitized if sanitized else "invalid_user"
 
-def get_user_chat_data_dir(username: str) -> Path:
-    return USER_DATA_BASE_DIR / sanitize_username(username)
-
-def get_user_chats_metadata_file(username: str) -> Path:
-    return get_user_chat_data_dir(username) / "chats_metadata.json"
-
-def get_user_chat_messages_dir(username: str) -> Path:
-    return get_user_chat_data_dir(username) / "chat_messages"
-
-def get_user_feedback_save_path(username: str) -> Path:
-    return FEEDBACK_SAVE_PATH_BASE / sanitize_username(username)
-
-def get_user_qa_log_path(username: str) -> Path:
-    return QA_LOG_PATH_BASE / sanitize_username(username)
+def get_user_chat_data_dir(username: str) -> Path: return USER_DATA_BASE_DIR / sanitize_username(username)
+def get_user_chats_metadata_file(username: str) -> Path: return get_user_chat_data_dir(username) / "chats_metadata.json"
+def get_user_chat_messages_dir(username: str) -> Path: return get_user_chat_data_dir(username) / "chat_messages"
+def get_user_feedback_save_path(username: str) -> Path: return FEEDBACK_SAVE_PATH_BASE / sanitize_username(username)
+def get_user_qa_log_path(username: str) -> Path: return QA_LOG_PATH_BASE / sanitize_username(username)
 
 async def get_current_username(x_username: Optional[str] = Header(None)) -> str:
     if x_username is None:
         logger.warning("請求中未找到 X-Username Header")
         raise HTTPException(status_code=400, detail="請求標頭中缺少 X-Username")
-    
     sanitized = sanitize_username(x_username)
     if not sanitized or sanitized == "invalid_user":
         logger.warning(f"提供的用戶名 '{x_username}' 清理後無效")
         raise HTTPException(status_code=400, detail="提供的用戶名無效")
-    
-    user_data_dir = get_user_chat_data_dir(sanitized)
-    user_data_dir.mkdir(parents=True, exist_ok=True)
-    (user_data_dir / "chat_messages").mkdir(parents=True, exist_ok=True)
-    
-    user_feedback_dir = get_user_feedback_save_path(sanitized)
-    user_feedback_dir.mkdir(parents=True, exist_ok=True)
-    
-    user_qa_dir = get_user_qa_log_path(sanitized)
-    user_qa_dir.mkdir(parents=True, exist_ok=True)
-
+    get_user_chat_data_dir(sanitized).mkdir(parents=True, exist_ok=True)
+    (get_user_chat_data_dir(sanitized) / "chat_messages").mkdir(parents=True, exist_ok=True)
+    get_user_feedback_save_path(sanitized).mkdir(parents=True, exist_ok=True)
+    get_user_qa_log_path(sanitized).mkdir(parents=True, exist_ok=True)
     return sanitized
 
-# --- Embedding and VectorDB Loading (Original - Unchanged) ---
+embedding_model_name = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-m3")
 try:
-    embedding_model_name = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-m3")
-    # logger.info(f"正在載入嵌入模型: {embedding_model_name}") # Logged in startup
     embedding = HuggingFaceEmbeddings(
         model_name=embedding_model_name,
         model_kwargs={"device": device},
         encode_kwargs={"normalize_embeddings": True}
     )
     _ = embedding.embed_query("測試嵌入模型")
-    # logger.info("✅ 嵌入模型載入並測試成功") # Logged in startup
 except Exception as e:
     logger.error(f"❌ 嵌入模型載入失敗: {str(e)}", exc_info=True)
     embedding = None
 
 @app.on_event("startup")
 def startup_event():
-    global vectordb
+    global vectordb, embedding_model_name
     logger.info(f"日誌級別設定為: {log_level}")
     logger.info(f"使用設備: {device}")
-
     if embedding is None:
         logger.error("❌ 嵌入模型未載入，無法初始化向量資料庫。")
     else:
@@ -225,13 +196,12 @@ def startup_event():
         except Exception as e:
             logger.error(f"❌ 向量資料庫載入失敗: {str(e)}", exc_info=True)
             vectordb = None
-    
     USER_DATA_BASE_DIR.mkdir(parents=True, exist_ok=True)
     FEEDBACK_SAVE_PATH_BASE.mkdir(parents=True, exist_ok=True)
     QA_LOG_PATH_BASE.mkdir(parents=True, exist_ok=True)
     logger.info(f"用戶特定數據的基礎目錄已準備就緒: {USER_DATA_BASE_DIR}, {FEEDBACK_SAVE_PATH_BASE}, {QA_LOG_PATH_BASE}")
 
-# --- Prompt Templates (Original - Unchanged, assuming they are correct) ---
+# --- Prompt Templates ---
 STRUCTURED_LIST_PROMPT = PromptTemplate(
     input_variables=["question", "context", "history", "format_mode"],
     template="""
@@ -416,19 +386,29 @@ You are a helpful assistant providing clear, paragraph-based explanations in **T
 CUSTOM_FORMAT_BASE_PROMPT = PromptTemplate(
     input_variables=["question", "context", "history", "format_mode"],
     template="""
-You are a helpful assistant providing information in **Traditional Chinese**. The user has asked a question and appears to have included specific instructions on the desired response format within their question text.
+You are a highly obedient and meticulous assistant providing information in **Traditional Chinese**. The user has asked a question and *explicitly included instructions on the desired response format* within their question text. Your SOLE and ABSOLUTE purpose is to follow these format instructions PRECISELY and LITERALLY, without any deviation or addition of your own styling.
 
-📌 **Format Mode:** {format_mode} (System detected: 'custom' - likely user-specified format in question)
+📌 **Format Mode:** {format_mode} (System detected: 'custom' - user-specified format in question)
 
-🚨 **最優先指令 (ABSOLUTE TOP PRIORITY):**
-仔細分析下方的 **User Question**。你的 **首要任務** 是 **精確地理解並嚴格遵守** 使用者在問題文字中包含的 **任何關於輸出格式的明確指示**。
-*   例如："請用一段話總結", "條列式說明優缺點", "製作一個比較表格", "summarize in bullet points", "給我點列式清單" 等。
-*   **使用者在問題中提出的格式要求，擁有絕對的最高優先權，必須覆蓋所有其他預設的格式或風格。**
-*   如果使用者的要求隱含了某種結構（如要求列表），請使用 **標準且語義正確的 Markdown** 來實現 (例如，列表使用 `* ` 或 `1. `，強調使用 `**粗體文字**`)。
-*   **嚴格確保 Markdown 語法的正確性：** `**粗體**` 必須使用兩個星號，**絕對避免** 使用多餘的星號 (如 `***標題***`) 或單個星號 (`*強調*`) 來表示粗體或標題。
+🚨 **絕對核心指令 - 必須一字不差地、完全排他地遵循 (ABSOLUTE CORE INSTRUCTIONS - MUST BE FOLLOWED LITERALLY AND EXCLUSIVELY):**
 
-💡 **例外情況處理:**
-如果經過仔細分析，你 **確認** 使用者的問題文字中 **確實沒有包含任何明確的格式指令** (即使 `format_mode` 被設為 'custom')，那麼請 **忽略 `custom` 模式**，並根據提供的上下文，以 **清晰、有條理的標準段落** 形式，完整地回答問題即可。
+1.  **完全複製使用者指定的字面格式 (Replicate User's Literal Format EXACTLY)**:
+    Carefully analyze the **User Question** below. Your **ONLY task** is to **EXACTLY replicate the user's specified output format, including all labels, colons, newlines, spacing, and casing as GIVEN BY THE USER.**
+    *   Example: If user specifies `Question: [question_content]\nAnswers: [answer_content]`, your output MUST be in this exact structure.
+
+2.  **針對多個項目 (例如多組QA) - 關鍵要求 (CRITICAL for Multiple Items, e.g., multiple QAs)**:
+    If the user requests multiple items (e.g., "給我20組QA", "列出5個優點"):
+    *   **EACH AND EVERY item/QA pair generated MUST independently and completely adhere to the user's specified format.**
+    *   **DO NOT** change the format or omit format labels (like `Question:`) after the first item.
+    *   **DO NOT** insert ANY extra text, numbering (unless specified by user), emojis, or separators BETWEEN the formatted items, unless explicitly part of the user's requested format. Each formatted item should follow the previous one directly, respecting newlines if specified in the format.
+
+3.  **禁止任何額外內容或風格 - 絕對排他性 (Prohibit ALL Extra Content or Styles - Absolute Exclusivity)**:
+    *   **ABSOLUTELY NO** conversational preambles, introductions, explanations, or meta-commentary (e.g., "好的，這是您要的格式：" or "以下是N組QA：").
+    *   Your response **MUST START DIRECTLY** with the user's requested formatted content.
+    *   **COMPLETELY IGNORE AND OVERRIDE ALL** default styling or formatting habits from any other prompts or your general training (e.g., NO emojis at the start of paragraphs, NO specific Markdown headers unless user asked for them, NO default list styles if user specified something else).
+    *   In this `custom` mode, **THE USER'S LITERAL SPECIFIED FORMAT IS THE ONLY AND EXCLUSIVE STANDARD. THERE ARE NO OTHER RULES.**
+
+4.  **內容生成 (Content Generation)**: While strictly adhering to the format, generate the content (questions, answers) based on the provided `Retrieved Context` and `Conversation History`. If the user asks for in-depth questions or specific topics, strive to meet those content requirements within the rigid format.
 
 📘 **Conversation History:** {history}
 📄 **Retrieved Context:** {context}
@@ -436,7 +416,18 @@ You are a helpful assistant providing information in **Traditional Chinese**. Th
 ❓ **User Question:**
 {question}
 
-👇 **請用繁體中文回答。絕對優先遵循使用者問題中的格式要求。若無明確要求，則以標準段落回答。請確保 Markdown 語法使用正確。**
+👇 **請用繁體中文回答。請「絕對嚴格地、一字不差地、排他地」遵循使用者在問題中指定的字面格式。特別是當要求多個項目時，確保每個項目都獨立且完整地遵循該格式。不要添加任何您自己的文字、標籤、表情符號或風格。直接開始輸出使用者要求的格式。**
+
+📝 **重要範例 - 使用者指定字面格式並要求多組QA (CRITICAL EXAMPLE - User specifies literal format for MULTIPLE QAs):**
+假設使用者的問題是: "給我2組有關USR計畫的QA，請用以下格式並且每個QA都要有深度：\nQuestion: [此處放問題]\nAnswers: [此處放答案]"
+
+你的輸出 **必須** 直接是 (沒有任何其他文字在前面或中間，每個QA獨立成對，並嚴格遵守換行):
+Question: USR計畫在促進大學與社區夥伴關係的長期永續性方面，除了資金考量外，還面臨哪些核心挑戰？應如何從大學治理與社區培力角度著手應對？
+Answers: 核心挑戰包括：一、社區夥伴的期望管理與大學能量的落差；二、計畫結束後社區自主運作能力的建構；三、大學內部跨單位協作的制度性障礙。大學治理層面應建立更彈性的USR專案支持機制與成果認定標準。社區培力則需著重於知識轉移、在地人才培育，以及協助建立社區自主組織。
+Question: 在評估USR計畫的社會影響力時，除了量化指標（如參與人數、滿意度），有哪些更具深度的質化評估方法能夠捕捉計畫對社區結構與關係網絡帶來的細微但長遠的改變？
+Answers: 深度質化評估方法可包括：一、參與式行動研究(PAR)，讓社區成員共同參與評估過程；二、社會網絡分析(SNA)，分析計畫前後社區內部及大學與社區間的互動網絡變化；三、敘事探究，收集並分析社區成員關於計畫影響的個人生命故事與集體記憶；四、運用「最顯著改變」技術(Most Significant Change)，從眾多故事中篩選並討論最具代表性的影響案例。
+
+(如果使用者要求的格式是 `Q: [問題]\nA: [答案]`，或者其他任何格式，你就必須一字不差地使用該格式。如果要求10組QA，就生成10組，每組都嚴格遵循。)
 """
 )
 RESEARCH_PROMPT_TEMPLATE = PromptTemplate(
@@ -448,7 +439,7 @@ You are a policy analyst and academic writer providing an evaluation in **Tradit
 
 🚨 **Formatting Guidelines (嚴格遵守):**
 
-*   **If `format_mode` is `custom`:** This means the user specified a custom output structure in their question. Follow the user's requested formatting **exactly**, maintaining a formal and academic tone. Use standard Markdown (`#`, `##`, `###`, `* list item`, `**bold**`) as appropriate unless the user specifies otherwise.
+*   **If `format_mode` is `custom`:** This means the user specified a custom output structure in their question. Follow the user's requested formatting **exactly**, maintaining a formal and academic tone. Use standard Markdown (`#`, `##`, `###`, `* list item`, `**bold**`) as appropriate only if explicitly part of the user's requested format or if the user's request clearly implies standard Markdown (e.g., "give me a list"). **Prioritize the user's literal format over adding Markdown not explicitly requested.**
 *   **If `format_mode` is `default`:** Follow the standard structured report format using **Markdown headings** as described below. Strictly adhere to the formatting rules.
 
     1.  **主標題 (Main Title):** 使用 `#` (一個井號) 作為整個報告的主標題 (若適用)。
@@ -469,48 +460,36 @@ You are a policy analyst and academic writer providing an evaluation in **Tradit
 {question}
 
 👇 **請用繁體中文回答:**
-*   若 `format_mode` 是 `custom`，請完全遵循使用者在問題中定義的格式。
+*   若 `format_mode` 是 `custom`，請完全遵循使用者在問題中定義的字面格式。**不要自行添加任何 Markdown 結構，除非使用者明確要求或其要求明顯暗示了標準 Markdown 結構。**
 *   若 `format_mode` 是 `default`，請嚴格遵守上述使用 **Markdown 標題 (`#`, `##`, `###`)** 的結構化報告格式。**粗體 (`**`) 僅用於內文特定詞語強調，不可用於標題或整個列表項目。**
 
 📝 **EXAMPLE OUTPUT FORMAT (when `format_mode` is "default"):**
-
 # 高雄小港空氣污染議題分析報告
-
 ## 一、成效亮點
 高雄小港區為台灣重要的工業重鎮，過去長期遭受石化業與重工業排放所帶來的空氣污染。自政府實施空污防制強化方案以來，已逐步見到成果：
-
 *   PM2.5 年均濃度下降：2023年，小港區PM2.5濃度首次降至15μg/m³以下，符應國家標準。
 *   高污染工廠改善：多家高污染事業完成鍋爐設備更新或污染防制設施強化。
 *   在地參與提升：透過社區論壇、校園教育及USR協作，小港居民參與空品改善活動人數顯著提升，展現地方共治的潛能。
-
 這些成果說明政策具備初步效益，也顯示社區力量在環境治理中日益關鍵。
-
 ## 二、主要挑戰與限制
 儘管已有顯著進展，小港區的空氣污染問題仍存在下列挑戰：
-
 *   結構性污染源持續存在：小港擁有多個大型石化工業區，污染物總量基數高，使得單一改善措施難以對空品產生劇烈改變。
 *   地形與氣候劣勢：背風側效應與氣候條件使污染物易滯留，加重局部污染濃度。
 *   政策協作落差：中央與地方在污染熱區資料整合與應變作為上，仍顯不足，導致反應時間延遲、缺乏即時調控力。
 *   公民動能不足：部分居民對空污議題已產生「習慣性麻痺」，缺乏主動監督與行動參與。
-
 ## 三、政策建議與改進方向
 為有效深化治理成效，建議可從以下三個策略推動：
-
 ### 1. 擴大感測與資訊公開
 *   建立高密度感測網，強化移動式監測。
 *   發展即時污染視覺化平台，提升公眾風險意識。
-
 ### 2. 產業轉型與排放總量控管
 *   推行「總量管制 + 差別費率」，引導污染業者升級。
 *   鼓勵潔淨能源使用與碳排透明揭露。
-
 ### 3. 強化社區共治與環境教育
 *   整合USR計畫與地方課程，發展空污資料解讀與倡議能力。
 *   建立社區參與制度，如居民空品會議、政策參與管道等。
-
 ## 四、總體觀察與評論
 小港空污問題的治理難度源自結構性深層因素，短期內難以徹底逆轉。然而，已有跡象顯示，只要政策持續推進並強化地方共治，將有機會轉危為機。特別是結合**科技監測**與**民眾行動力**，能構築出一套適合台灣重工業都市的永續治理模式。
-
 ## 五、結論
 高雄小港的空污改善歷程是台灣工業區環境治理的縮影。持續落實「科技導向 + 公民參與 + 法制改革」三位一體的策略，將是未來提升空品與健康福祉的關鍵方向。
 """
@@ -521,12 +500,11 @@ DEFAULT_PROMPT_OPTIONS = [
     PARAGRAPH_EMOJI_LEAD_PROMPT
 ]
 
-# --- LLM Configuration and Loading (Original - Unchanged) ---
 common_llm_config = { "temperature": 0.1, "top_p": 0.8 }
 SUPPORTED_MODELS = [
-    "qwen2.5:14b", "gemma3:12b", "gemma3:12b-it-q4_K_M", "qwen2.5:14b-instruct-q5_K_M",
+    "qwen3:14b", "gemma3:12b", "gemma3:12b-it-q4_K_M", "qwen2.5:14b-instruct-q5_K_M",
 ]
-DEFAULT_MODEL = "gemma3:12b"
+DEFAULT_MODEL = "gemma3:12b" # Or your preferred default
 
 @lru_cache(maxsize=5)
 def get_model(model_name: str) -> Optional[OllamaLLM]:
@@ -535,24 +513,22 @@ def get_model(model_name: str) -> Optional[OllamaLLM]:
         model_name = DEFAULT_MODEL
     try:
         logger.info(f"⏳ 正在載入或獲取緩存的模型: {model_name}...")
-        model = OllamaLLM(model=model_name, **common_llm_config, request_timeout=300.0)
-        _ = model.invoke("請做個自我介紹") # Test invocation
+        model = OllamaLLM(model=model_name, **common_llm_config, request_timeout=600.0)
+        _ = model.invoke("請做個自我介紹")
         logger.info(f"✅ 模型 {model_name} 載入並測試成功")
         return model
     except Exception as e:
         logger.error(f"❌ 載入或測試模型 {model_name} 失敗: {str(e)}", exc_info=True)
         return None
 
-# --- Rate Limiting Middleware (Original - Unchanged) ---
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    # Apply rate limiting to both /chat and new public API path
-    if "/chat" in str(request.url) or "/api/v1/public/rag/ask" in str(request.url): # <--- MODIFIED: Added public API path
+    if "/chat" in str(request.url) or "/api/v1/public/rag/ask" in str(request.url):
         client_ip = request.client.host if request.client else "unknown"
         current_time = time.time()
         request_timestamps = request_counters.get(client_ip, [])
-        valid_timestamps = [t for t in request_timestamps if current_time - t < 60] # 60 seconds window
-        rate_limit_count = 30 # 30 requests per minute per IP
+        valid_timestamps = [t for t in request_timestamps if current_time - t < 60]
+        rate_limit_count = 30
         if len(valid_timestamps) >= rate_limit_count:
             logger.warning(f"🚦 速率限制觸發: IP {client_ip} for URL {request.url}")
             from fastapi.responses import JSONResponse
@@ -561,8 +537,6 @@ async def rate_limit_middleware(request: Request, call_next):
         request_counters[client_ip] = valid_timestamps
     return await call_next(request)
 
-
-# --- Pydantic Models for existing frontend (Original - Unchanged) ---
 class ChatRequest(BaseModel):
     session_id: str
     question: str
@@ -577,150 +551,212 @@ class FeedbackRequest(BaseModel):
     user_expected_question: Optional[str] = None
     user_expected_answer: str
 
-class ChatListItem(BaseModel):
-    id: str
-    title: str
-    updated_at: str
+class ChatListItem(BaseModel): id: str; title: str; updated_at: str
+class NewChatRequest(BaseModel): id: str; title: str
+class RenameChatRequest(BaseModel): title: str
+class Message(BaseModel): role: str; content: str
 
-class NewChatRequest(BaseModel):
-    id: str
-    title: str
-
-class RenameChatRequest(BaseModel):
-    title: str
-
-class Message(BaseModel):
-    role: str
-    content: str
-
-# --- Utility functions for chat data storage (Original - Unchanged) ---
 def _load_user_chats_metadata(username: str) -> Dict[str, Dict[str, str]]:
     metadata_file = get_user_chats_metadata_file(username)
     if metadata_file.exists():
         try:
-            with open(metadata_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"❌ 無法為用戶 {username} 加載聊天元數據: {e}", exc_info=True)
+            with open(metadata_file, "r", encoding="utf-8") as f: return json.load(f)
+        except Exception as e: logger.error(f"❌ 無法為用戶 {username} 加載聊天元數據: {e}", exc_info=True)
     return {}
 
 def _save_user_chats_metadata(username: str, metadata: Dict[str, Dict[str, str]]):
     metadata_file = get_user_chats_metadata_file(username)
     try:
-        # Sort by updated_at descending before saving
         sorted_metadata = dict(sorted(metadata.items(), key=lambda item: item[1].get('updated_at', '1970-01-01T00:00:00Z'), reverse=True))
-        with open(metadata_file, "w", encoding="utf-8") as f:
-            json.dump(sorted_metadata, f, ensure_ascii=False, indent=2)
+        with open(metadata_file, "w", encoding="utf-8") as f: json.dump(sorted_metadata, f, ensure_ascii=False, indent=2)
         logger.debug(f"用戶 {username} 的聊天元數據已保存到 {metadata_file}")
-    except Exception as e:
-        logger.error(f"❌ 保存用戶 {username} 的聊天元數據失敗: {e}", exc_info=True)
+    except Exception as e: logger.error(f"❌ 保存用戶 {username} 的聊天元數據失敗: {e}", exc_info=True)
 
 def _get_user_chat_messages(username: str, chat_id: str) -> List[Dict[str, str]]:
     message_file = get_user_chat_messages_dir(username) / f"{chat_id}.json"
     if message_file.exists():
         try:
-            with open(message_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"❌ 無法讀取用戶 {username} 聊天 {chat_id} 的訊息: {e}", exc_info=True)
+            with open(message_file, "r", encoding="utf-8") as f: return json.load(f)
+        except Exception as e: logger.error(f"❌ 無法讀取用戶 {username} 聊天 {chat_id} 的訊息: {e}", exc_info=True)
     return []
 
 def _save_user_chat_messages(username: str, chat_id: str, messages: List[Dict[str, str]]):
     message_file = get_user_chat_messages_dir(username) / f"{chat_id}.json"
     try:
-        with open(message_file, "w", encoding="utf-8") as f:
-            json.dump(messages, f, ensure_ascii=False, indent=2)
+        with open(message_file, "w", encoding="utf-8") as f: json.dump(messages, f, ensure_ascii=False, indent=2)
         logger.debug(f"用戶 {username} 聊天 {chat_id} 的訊息已保存到 {message_file}")
-    except Exception as e:
-        logger.error(f"❌ 保存用戶 {username} 聊天 {chat_id} 的訊息失敗: {e}", exc_info=True)
+    except Exception as e: logger.error(f"❌ 保存用戶 {username} 聊天 {chat_id} 的訊息失敗: {e}", exc_info=True)
 
-# --- Post Processing Function (Original - Unchanged) ---
-def post_process_answer(answer: str) -> str:
+# MODIFIED: post_process_answer with refined Markdown handling for default mode
+# MODIFIED: post_process_answer with EXTREMELY conservative Markdown handling for default mode
+def post_process_answer(answer: str, format_mode: str = "default") -> str:
     original_answer = answer
-    try:
-        patterns = [
-            r"^\s*根據提供的文本[,，]?\s*",r"^\s*文本指出[,，]?\s*",
-            r"^\s*文本未(?:直接)?提及(?:，|,)但可以推斷[,，]?\s*", r"^\s*以下將.*?格式呈現：?\s*",
-            r"^\s*這份文件提到(?:了)?\s*", r"^\s*好的[,，]?\s*", r"^\s*是的[,，]?\s*",
-            r"^\s*Here is the.*?you requested[:.]?\s*",]
-        for p in patterns: answer = re.sub(p, "", answer, count=1, flags=re.IGNORECASE|re.MULTILINE).lstrip()
-        def replace_lack(m): return "執法機制的有效性是影響改善速度的關鍵因素。"
-        answer = re.sub(r"(\n\s*|\A\s*)(缺乏嚴格的執法機制.*?)(?:\s*。|\s*\n|\s*$)", lambda m: m.group(1) + replace_lack(m), answer, flags=re.MULTILINE)
-        answer = re.sub(r"(\n\s*|\A\s*)(這可能涉及.*?(?:。|\n|$))", r"\1", answer, flags=re.MULTILINE)
-        to_remove = ["(文本未直接提及，但可推測)","文章多次提及", "文章提及","文本提及", "根據文本","文件提及", "根據文件","可推論", "但可推論"]
-        for ph in to_remove: answer = answer.replace(ph, "")
-        answer = re.sub(r'[ \t]{2,}', ' ', answer)
-        answer = re.sub(r'\s+([,.:;!?，。：；！？])', r'\1', answer)
-        answer = re.sub(r'([,.:;!?，。：；！？])([^\s,.:;!?，。：；！？\n])', r'\1 \2', answer)
-        answer = re.sub(r'^\s*[,，：:]\s*', '', answer).strip()
-        markers = ["📘 Conversation History:", "📄 Retrieved Context:","❓ User Question:", "👇 Please write your answer","📝 EXAMPLE OUTPUT FORMAT", "You are a helpful assistant","You are a policy analyst"]
-        for m in markers:
-            if m in answer: answer = answer.split(m, 1)[0].strip()
-        answer = re.sub(r'(?m)^\s*[\*\-]\s*', '• ', answer)
-        answer = re.sub(r'(?m)^(•\s*)\*(?=[一二三四五六七八九十]+、)',r'\1',answer)
-        answer = re.sub(r'(?m)^(•.*?)[*]+\s*$',r'\1',answer)
-        answer = re.sub(r'\*{3,}', '**', answer)
-        answer = answer.replace('** ', '**').replace(' **', '**')
-        answer = re.sub(r'(?m)^###\s+(.*?)\s*$', r'<h3>\1</h3>', answer)
-        answer = re.sub(r'(?m)^##\s+(.*?)\s*$', r'<h2>\1</h2>', answer)
-        answer = re.sub(r'(?m)^#\s+(.*?)\s*$', r'<h1>\1</h1>', answer)
-        answer = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', answer)
-        answer = re.sub(r'\n{3,}', '\n\n', answer).strip()
-        return answer or original_answer
-    except Exception as e:
-        logger.error(f"❌ Post-processing failed: {e}", exc_info=True)
-        return original_answer
+    processed_answer = answer  # Start with the original answer
 
-# --- Existing API routes for frontend (Original - Unchanged) ---
+    try:
+        # 1. Strip leading/trailing whitespace from the whole answer FIRST
+        processed_answer = processed_answer.strip()
+
+        # --- ADDED: Remove LLM preamble/explanatory phrases ---
+        # These phrases are typically at the beginning of a response or a new paragraph.
+        # We use re.IGNORECASE for case-insensitivity and re.UNICODE.
+        llm_explanatory_phrases = [
+            r"^\s*根據提供的資訊(?:內容)?(?:，|：|,|:)?\s*",
+            r"^\s*根據你提供的資訊(?:，|：|,|:)?\s*",
+            r"^\s*根據提供的文本(?:內容)?(?:，|：|,|:)?\s*",
+            r"^\s*根據提供的上下文(?:，|：|,|:)?\s*",
+            r"^\s*根據文檔(?:內容)?(?:，|：|,|:)?\s*",
+            r"^\s*根據以上資訊(?:，|：|,|:)?\s*",
+            r"^\s*從提供的資料來看(?:，|：|,|:)?\s*",
+            r"^\s*資料顯示(?:，|：|,|:)?\s*",
+            r"^\s*文本中提到(?:，|：|,|:)?\s*",
+            r"^\s*文件中說明(?:，|：|,|:)?\s*",
+            r"^\s*雖然資訊(?:中)?(?:並未|沒有)(?:明確)?(?:列出|指出|提及)(?:，|：|,|:)?\s*",
+            r"^\s*雖然提供的資料顯示(?:，|：|,|:)?\s*",
+            r"^\s*是的，根據資料(?:，|：|,|:)?\s*",
+            r"^\s*好的，根據您的問題和提供的資料(?:，|：|,|:)?\s*",
+            r"^\s*在提供的資料中(?:，|：|,|:)?\s*",
+            r"^\s*從上下文中我們可以得知(?:，|：|,|:)?\s*",
+            r"^\s*根據上下文(?:，|：|,|:)?\s*",
+            r"^\s*文中(?:並未|沒有)明確提及(?:，|：|,|:)?\s*",
+            r"^\s*以下是.*?的回答：\s*",
+            r"^\s*針對您的問題(?:，|：|,|:)?\s*",
+            r"^\s*回答如下(?:，|：|,|:)?\s*",
+            # Add more patterns as observed
+        ]
+
+        # Apply removal of explanatory phrases
+        # We loop a few times in case one removal uncovers another preamble.
+        for _ in range(3): # Loop a few times to catch nested/sequential preambles
+            cleaned_this_iteration = False
+            for phrase_pattern in llm_explanatory_phrases:
+                # Use re.match to ensure it's at the beginning of the current processed_answer
+                match = re.match(phrase_pattern, processed_answer, flags=re.IGNORECASE | re.UNICODE)
+                if match:
+                    new_answer = processed_answer[match.end():].lstrip(" ，。、；：:,.")
+                    if new_answer != processed_answer:
+                        processed_answer = new_answer
+                        cleaned_this_iteration = True
+            if not cleaned_this_iteration:
+                break # No changes in this iteration, so stop
+        # --- ADDED END ---
+
+        if format_mode == "custom":
+            # --- Custom Mode: Minimal cleaning after preamble removal ---
+            # Remove common LLM preambles if they slip through (might be redundant now but safe)
+            processed_answer = re.sub(
+                r"^\s*(好的，這是您要求的格式：|好的，這就為您提供：|根據您的要求，格式如下：|好的，這就為您呈現：|以下是符合您要求的格式：)\s*",
+                "", processed_answer, flags=re.IGNORECASE | re.MULTILINE
+            ).lstrip()
+
+            if "Question:" in original_answer and "Answers:" in original_answer:
+                match_q = re.search(r"Question\s*:", processed_answer, re.IGNORECASE)
+                if match_q and match_q.start() > 0:
+                    preamble_candidate = processed_answer[:match_q.start()]
+                    if len(preamble_candidate) < 100 and "以下" not in preamble_candidate and "：" not in preamble_candidate[-5:]:
+                        logger.debug(f"Custom format: Stripping potential preamble: '{preamble_candidate}'")
+                        processed_answer = processed_answer[match_q.start():]
+                elif match_q and match_q.start() == 0:
+                    pass
+                else:
+                    # If preambles were removed above, this warning might be less frequent
+                    logger.warning(f"Custom format: 'Question:' expected but not found at start. Processed: '{processed_answer[:100]}...'")
+
+            processed_answer = re.sub(r'\n{3,}', '\n\n', processed_answer).strip()
+            # Log for custom mode if changes were made (excluding initial strip)
+            if original_answer.strip() != processed_answer: # Compare after initial strip of original
+                 log_message_custom = f"Custom format post-processing. Orig len: {len(original_answer.strip())}, Proc len: {len(processed_answer)}. Starts with: '{processed_answer[:100]}...'"
+                 logger.info(log_message_custom)
+            else:
+                 logger.debug(f"Custom format post-processing made no significant changes beyond initial strip.")
+            return processed_answer or original_answer.strip() # Ensure original is also stripped for comparison
+
+        # --- Default Mode: Extremely conservative cleaning after preamble removal ---
+
+        # 2. Remove known LLM artifacts/template leakage (usually safe)
+        #    This should run AFTER preamble removal.
+        markers_to_remove = [
+            "📘 Conversation History:", "📄 Retrieved Context:", "❓ User Question:",
+            "👇 Please write your answer", "📝 EXAMPLE OUTPUT FORMAT",
+            "You are a helpful assistant", "You are a policy analyst",
+            "📌 **Format Mode:**"
+        ]
+        for m in markers_to_remove:
+            if m in processed_answer:
+                processed_answer = processed_answer.split(m, 1)[0].strip()
+
+        # 3. Normalize multiple newlines to a maximum of two (usually safe for Markdown)
+        processed_answer = re.sub(r'\n{3,}', '\n\n', processed_answer)
+
+        # 4. Normalize bold syntax (keep this conservative)
+        processed_answer = re.sub(r'\*{3,}(?P<content>.+?)\*{3,}', r'**\g<content>**', processed_answer)
+        processed_answer = re.sub(r'\*{3,}', '**', processed_answer)
+        processed_answer = re.sub(r'\*\*\s*(?P<content>.*?)\s*\*\*', r'**\g<content>**', processed_answer)
+        # The following emoji/specific term bolding rules were part of the previous attempt to fix * display issues.
+        # Since the primary issue is now about removing preambles, and frontend handles Markdown rendering,
+        # these backend regexes for altering * to ** might be too aggressive or conflict.
+        # Consider removing or heavily testing them if they cause unintended side effects.
+        # For now, I'm commenting them out to ensure max conservatism from backend on MD structure.
+        # processed_answer = re.sub(r'([🏭🚗💨🌍💡🚨📊📈🔍📝])\*(?P<content>[^\*]+?)\*', r'\1**\g<content>**', processed_answer)
+        # processed_answer = re.sub(r'(^|\n)\*(?P<content>[^\*:]+?(?:源|類|法|策略|措施|評估)[^\*]*?)\*(?=:|：|\s|$)', r'\1**\g<content>**', processed_answer, flags=re.MULTILINE)
+
+
+        # 5. Remove trailing whitespace from each line (generally safe)
+        processed_answer = "\n".join([line.rstrip() for line in processed_answer.splitlines()])
+
+        # 6. Final strip of leading/trailing whitespace from the whole answer
+        processed_answer = processed_answer.strip()
+
+
+        if original_answer.strip() != processed_answer:
+            log_message_default = f"Default format (conservative) post-processing. Orig len: {len(original_answer.strip())}, Proc len: {len(processed_answer)}. Starts with: '{processed_answer[:100]}...'"
+            logger.info(log_message_default)
+        else:
+            logger.debug(f"Default format post-processing made no significant changes beyond initial strip.")
+
+        return processed_answer or original_answer.strip()
+
+    except Exception as e:
+        logger.error(f"❌ Post-processing failed: {e}. Original Answer: '{original_answer[:200]}...'", exc_info=True)
+        return original_answer # Fallback to original answer on error
+
+
 @api_router.get("/chats", response_model=List[ChatListItem])
 async def get_chat_list_for_user(username: str = Depends(get_current_username)):
     user_chats_metadata = _load_user_chats_metadata(username)
-    chat_list = [
-        ChatListItem(id=chat_id, title=meta.get("title", "無標題"), updated_at=meta.get("updated_at", ""))
-        for chat_id, meta in user_chats_metadata.items()
-    ]
-    # Already sorted by _save_user_chats_metadata, but defensive sort here is fine.
+    chat_list = [ChatListItem(id=chat_id, title=meta.get("title", "無標題"), updated_at=meta.get("updated_at", "")) for chat_id, meta in user_chats_metadata.items()]
     chat_list.sort(key=lambda x: x.updated_at, reverse=True)
     return chat_list
 
 @api_router.post("/chats", response_model=ChatListItem)
 async def create_new_chat_for_user(req: NewChatRequest, username: str = Depends(get_current_username)):
     user_chats_metadata = _load_user_chats_metadata(username)
-    chat_id = req.id
-    title = req.title
-    if chat_id in user_chats_metadata:
-        raise HTTPException(status_code=409, detail=f"聊天 ID {chat_id} 已存在")
-    
+    if req.id in user_chats_metadata: raise HTTPException(status_code=409, detail=f"聊天 ID {req.id} 已存在")
     now_iso = datetime.now().isoformat()
-    user_chats_metadata[chat_id] = {"title": title, "created_at": now_iso, "updated_at": now_iso}
+    user_chats_metadata[req.id] = {"title": req.title, "created_at": now_iso, "updated_at": now_iso}
     _save_user_chats_metadata(username, user_chats_metadata)
-    _save_user_chat_messages(username, chat_id, []) # Create empty messages file
-    logger.info(f"✅ 用戶 {username} 的新聊天已創建: ID={chat_id}, Title='{title}'")
-    return ChatListItem(id=chat_id, title=title, updated_at=now_iso)
+    _save_user_chat_messages(username, req.id, [])
+    logger.info(f"✅ 用戶 {username} 的新聊天已創建: ID={req.id}, Title='{req.title}'")
+    return ChatListItem(id=req.id, title=req.title, updated_at=now_iso)
 
 @api_router.get("/chats/{chat_id}/messages", response_model=List[Message])
 async def get_chat_messages_for_user(chat_id: str, username: str = Depends(get_current_username)):
-    user_chats_metadata = _load_user_chats_metadata(username) # Check if chat_id belongs to user
+    user_chats_metadata = _load_user_chats_metadata(username)
     if chat_id not in user_chats_metadata:
         logger.warning(f"用戶 {username} 請求不存在或不屬於他的聊天 {chat_id} 的訊息。")
         raise HTTPException(status_code=404, detail=f"聊天 ID {chat_id} 未找到")
-
     messages = _get_user_chat_messages(username, chat_id)
     return [Message(role=msg["role"], content=msg["content"]) for msg in messages]
 
 @api_router.put("/chats/{chat_id}", response_model=ChatListItem)
 async def rename_chat_for_user(chat_id: str, req: RenameChatRequest, username: str = Depends(get_current_username)):
     user_chats_metadata = _load_user_chats_metadata(username)
-    if chat_id not in user_chats_metadata:
-        raise HTTPException(status_code=404, detail=f"聊天 ID {chat_id} 未找到")
-    
+    if chat_id not in user_chats_metadata: raise HTTPException(status_code=404, detail=f"聊天 ID {chat_id} 未找到")
     new_title = req.title.strip()
-    if not new_title:
-        raise HTTPException(status_code=400, detail="標題不能為空")
-    
+    if not new_title: raise HTTPException(status_code=400, detail="標題不能為空")
     now_iso = datetime.now().isoformat()
     user_chats_metadata[chat_id]["title"] = new_title
-    user_chats_metadata[chat_id]["updated_at"] = now_iso # Update timestamp on rename
+    user_chats_metadata[chat_id]["updated_at"] = now_iso
     _save_user_chats_metadata(username, user_chats_metadata)
     logger.info(f"✅ 用戶 {username} 的聊天已重命名: ID={chat_id}, New Title='{new_title}'")
     return ChatListItem(id=chat_id, title=new_title, updated_at=now_iso)
@@ -728,76 +764,59 @@ async def rename_chat_for_user(chat_id: str, req: RenameChatRequest, username: s
 @api_router.delete("/chats/{chat_id}", status_code=204)
 async def delete_chat_for_user(chat_id: str, username: str = Depends(get_current_username)):
     user_chats_metadata = _load_user_chats_metadata(username)
-    if chat_id not in user_chats_metadata:
-        raise HTTPException(status_code=404, detail=f"聊天 ID {chat_id} 未找到")
-    
+    if chat_id not in user_chats_metadata: raise HTTPException(status_code=404, detail=f"聊天 ID {chat_id} 未找到")
     del user_chats_metadata[chat_id]
     _save_user_chats_metadata(username, user_chats_metadata)
-    
     message_file = get_user_chat_messages_dir(username) / f"{chat_id}.json"
     if message_file.exists():
         try:
             message_file.unlink()
             logger.info(f"用戶 {username} 的聊天訊息文件 {message_file} 已刪除。")
-        except Exception as e:
-            logger.error(f"❌ 刪除用戶 {username} 的聊天訊息文件 {message_file} 失敗: {e}", exc_info=True)
-            # Potentially raise HTTPException if critical, or just log
-    
+        except Exception as e: logger.error(f"❌ 刪除用戶 {username} 的聊天訊息文件 {message_file} 失敗: {e}", exc_info=True)
     logger.info(f"🗑️ 用戶 {username} 的聊天已刪除: ID={chat_id}")
-    # Logic to delete user directory if no chats remain
-    if not user_chats_metadata: # Check if metadata is now empty
+    if not user_chats_metadata:
         user_chat_data_d = get_user_chat_data_dir(username)
         user_chat_messages_d = get_user_chat_messages_dir(username)
         try:
-            # Check if messages directory is also empty
-            if user_chat_messages_d.exists() and not any(user_chat_messages_d.iterdir()):
-                shutil.rmtree(user_chat_data_d) # Remove entire user_specific_chat_data/username dir
-                logger.info(f"用戶 {username} 的數據目錄 {user_chat_data_d} 因無聊天記錄而被刪除。")
-        except Exception as e:
-            logger.error(f"❌ 刪除空的用戶 {username} 數據目錄 {user_chat_data_d} 失敗: {e}", exc_info=True)
+            if user_chat_messages_d.exists() and not any(user_chat_messages_d.iterdir()): # Check if messages dir is empty
+                if user_chat_data_d.exists(): # Check if base user data dir exists before trying to delete
+                    shutil.rmtree(user_chat_data_d)
+                    logger.info(f"用戶 {username} 的數據目錄 {user_chat_data_d} 因無聊天記錄而被刪除。")
+        except Exception as e: logger.error(f"❌ 刪除空的用戶 {username} 數據目錄 {user_chat_data_d} 失敗: {e}", exc_info=True)
     return None
 
-
-# --- MODIFIED: Extracted Core RAG Processing Logic ---
-class PublicRAGDocumentSource(BaseModel): # Define here for process_rag_request return type hint
+class PublicRAGDocumentSource(BaseModel):
     content: str
     metadata: Dict
 
 async def process_rag_request(
-    username: str,
-    session_id: str,
-    question: str,
-    selected_model: str,
-    prompt_mode: str,
-) -> Dict: # Return type is Dict, will be wrapped by Pydantic model later
+    username: str, session_id: str, question: str,
+    selected_model: str, prompt_mode: str,
+) -> Dict:
     start_all_processing = time.time()
-
     if not question:
-        logger.warning(f"⚠️ 用戶 {username} (via {'API' if username.startswith('api_consumer_') else 'Frontend'}) 收到空問題。")
-        raise HTTPException(status_code=400, detail="問題不能為空 (Question cannot be empty).")
-
+        logger.warning(f"⚠️ 用戶 {username} 收到空問題。")
+        raise HTTPException(status_code=400, detail="問題不能為空.")
     llm = get_model(selected_model)
     if llm is None:
-        logger.error(f"❌ RAG process error for user {username}: LLM '{selected_model}' not loaded.")
-        raise HTTPException(status_code=500, detail=f"無法載入語言模型 (Could not load language model) '{selected_model}'.")
+        logger.error(f"❌ RAG process error: LLM '{selected_model}' not loaded.")
+        raise HTTPException(status_code=500, detail=f"無法載入語言模型 '{selected_model}'.")
     if vectordb is None:
-        logger.error(f"❌ RAG process error for user {username}: Vector database not available.")
-        raise HTTPException(status_code=500, detail="向量資料庫不可用 (Vector database not available).")
+        logger.error(f"❌ RAG process error: Vector database not available.")
+        raise HTTPException(status_code=500, detail="向量資料庫不可用.")
 
     user_chats_metadata = _load_user_chats_metadata(username)
     if session_id not in user_chats_metadata:
         now_iso = datetime.now().isoformat()
-        default_title = question[:30].strip() + "..." if len(question) > 30 else question.strip()
-        if not default_title: default_title = f"對話 {session_id[:8]}"
+        default_title = question[:30].strip() + "..." if len(question) > 30 else question.strip() or f"對話 {session_id[:8]}"
         user_chats_metadata[session_id] = {"title": default_title, "created_at": now_iso, "updated_at": now_iso}
         _save_user_chats_metadata(username, user_chats_metadata)
         _save_user_chat_messages(username, session_id, [])
-        logger.info(f"ℹ️ 自動為用戶 {username} 的 session_id '{session_id}' 創建了聊天元數據。標題: '{default_title}'")
+        logger.info(f"ℹ️ 自動為用戶 {username} session '{session_id}' 創建聊天元數據. 標題: '{default_title}'")
 
-    detected_format_mode = detect_format_mode(question)
-    format_mode = detected_format_mode
-    logger.info(f"🚀 Processing RAG - User: {username}, SessionID: {session_id}, Model: {selected_model}, PromptMode: {prompt_mode}, FormatMode: {format_mode}")
-    logger.info(f"❓ Question for {username}: {question}")
+    format_mode = detect_format_mode(question)
+    logger.info(f"🚀 RAG - User: {username}, Session: {session_id}, Model: {selected_model}, PromptMode(TemplateGroup): {prompt_mode}, FormatMode(LLMInstruction): {format_mode}")
+    logger.info(f"❓ Question for {username}: {question[:200]}...") # Log truncated question
 
     messages_for_prompt_history = _get_user_chat_messages(username, session_id)
     history_pairs = []
@@ -807,35 +826,30 @@ async def process_rag_request(
         elif msg_dict["role"] == "assistant" and temp_user_q:
             history_pairs.append((temp_user_q, msg_dict["content"]))
             temp_user_q = None
-    history_text = "\n".join([f"使用者: {q}\n助理: {a}" for q, a in history_pairs[-MAX_HISTORY_PER_SESSION:]]) if history_pairs else "無歷史對話紀錄。"
+    history_text = "\n".join([f"使用者: {q}\n助理: {a}" for q, a in history_pairs[-MAX_HISTORY_PER_SESSION:]]) or "無歷史對話紀錄。"
 
     start_retrieve = time.time()
-
-    #mmr
-    #retriever_k = 20; retriever_fetch_k = 50; retriever_lambda_mult = 0.8
-    #retriever = vectordb.as_retriever(search_type="mmr", search_kwargs={"k": retriever_k, "fetch_k": retriever_fetch_k, "lambda_mult": retriever_lambda_mult})
     retriever_k = 20
-    retriever = vectordb.as_retriever(
-        search_type="similarity_score_threshold",
-        search_kwargs={"k": retriever_k, "score_threshold": 0.5}
-    )
-    retrieved_docs_list: List[Dict] = [] # For storing docs in a serializable way
+    retriever = vectordb.as_retriever(search_type="similarity_score_threshold", search_kwargs={"k": retriever_k, "score_threshold": 0.5})
+    retrieved_docs_list: List[Dict] = []
     context_str = "沒有找到相關的背景資料。"
+    docs_langchain = []
     try:
-        docs_langchain = retriever.invoke(question) # Langchain Document objects
+        docs_langchain = retriever.invoke(question)
         if docs_langchain:
             context_str = "\n\n".join([doc.page_content for doc in docs_langchain])
             retrieved_docs_list = [{"content": doc.page_content, "metadata": doc.metadata} for doc in docs_langchain]
-        logger.info(f"⏱️ Retrieval time: {time.time() - start_retrieve:.2f}s, Found {len(docs_langchain)} docs for user {username}.")
+        logger.info(f"⏱️ Retrieval: {time.time() - start_retrieve:.2f}s, Found {len(docs_langchain)} docs for {username}.")
     except Exception as e:
-        logger.error(f"❌ Retrieval error for user {username}, q='{question}': {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"向量資料庫檢索錯誤 (Vector database retrieval error): {str(e)}")
+        logger.error(f"❌ Retrieval error for {username}, q='{question[:100]}...': {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"向量資料庫檢索錯誤: {str(e)}")
 
-    selected_template = None
+    selected_template: Optional[PromptTemplate] = None
     template_name_for_log = "N/A"
+
     if prompt_mode == "research":
         selected_template = RESEARCH_PROMPT_TEMPLATE
-        template_name_for_log = f"Research ({'User Format' if format_mode == 'custom' else 'Default Format'})"
+        template_name_for_log = f"Research (Format: {format_mode})"
     elif format_mode == "custom":
         selected_template = CUSTOM_FORMAT_BASE_PROMPT
         template_name_for_log = "Custom Format Request"
@@ -845,39 +859,61 @@ async def process_rag_request(
         elif selected_template == HIERARCHICAL_BULLETS_PROMPT: template_name_for_log = "Default Style (Random: Hierarchical Bullets)"
         elif selected_template == PARAGRAPH_EMOJI_LEAD_PROMPT: template_name_for_log = "Default Style (Random: Paragraph Emoji Lead)"
         else: template_name_for_log = "Default Style (Random: Unknown)"
-    logger.info(f"Using template for user {username}: {template_name_for_log}")
+    
+    if selected_template is None:
+        logger.error(f"❌ Critical error: No template selected for prompt_mode '{prompt_mode}' and format_mode '{format_mode}'")
+        raise HTTPException(status_code=500, detail="內部錯誤：無法選擇提示模板。")
+        
+    logger.info(f"Using template for {username}: {template_name_for_log} (PromptMode: {prompt_mode}, Detected FormatMode: {format_mode})")
 
     try:
-        prompt = selected_template.format(context=context_str, question=question, history=history_text, format_mode=format_mode)
+        prompt_input = {"context": context_str, "question": question, "history": history_text, "format_mode": format_mode}
+        prompt = selected_template.format(**prompt_input)
     except Exception as e:
-        logger.error(f"❌ Prompt formatting error for user {username}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="內部錯誤：提示詞格式化失敗 (Internal error: Prompt formatting failed).")
+        logger.error(f"❌ Prompt formatting error for {username}: {e} with input keys {list(prompt_input.keys())}", exc_info=True)
+        raise HTTPException(status_code=500, detail="內部錯誤：提示詞格式化失敗.")
 
     final_answer = None
     llm_actual_attempts = 0
     start_llm_total_processing = time.time()
-    current_llm_retries_count = 0
-    while current_llm_retries_count <= MAX_LLM_RETRIES:
+    
+    for attempt in range(MAX_LLM_RETRIES + 1):
+        llm_actual_attempts = attempt + 1 # Ensure this is set even if error occurs early
         try:
             start_llm_one_attempt = time.time()
             raw_answer = llm.invoke(prompt)
-            processed_answer = post_process_answer(raw_answer.strip())
-            llm_actual_attempts = current_llm_retries_count + 1
-            logger.info(f"⏱️ LLM response (Attempt {llm_actual_attempts}) for user {username}: {time.time() - start_llm_one_attempt:.2f}s")
-            if not processed_answer or processed_answer.isspace():
-                raise ValueError("LLM returned empty or whitespace answer")
-            final_answer = processed_answer
-            break
-        except Exception as e:
-            logger.error(f"❌ LLM error (Attempt {current_llm_retries_count + 1}) for user {username}: {e}", exc_info=True)
-            current_llm_retries_count += 1
-            if current_llm_retries_count <= MAX_LLM_RETRIES:
-                time.sleep(1)
-        if final_answer: break
+            logger.info(f"⏱️ LLM raw response (Attempt {llm_actual_attempts}) for {username}: {time.time() - start_llm_one_attempt:.2f}s. Length: {len(raw_answer)}")
+            if logger.isEnabledFor(logging.DEBUG): # Avoid formatting large string if not needed
+                 logger.debug(f"LLM raw output (Attempt {llm_actual_attempts}) for {username} before post-processing: '{raw_answer[:500]}...'")
 
+            processed_answer = post_process_answer(raw_answer, format_mode=format_mode)
+            if logger.isEnabledFor(logging.DEBUG):
+                 logger.debug(f"LLM output (Attempt {llm_actual_attempts}) for {username} AFTER post-processing: '{processed_answer[:500]}...'")
+
+            if not processed_answer or processed_answer.isspace():
+                logger.warning(f"LLM returned empty/whitespace answer (Attempt {llm_actual_attempts}) for {username} after processing. Raw: '{raw_answer[:200]}...'")
+                if attempt < MAX_LLM_RETRIES: 
+                    logger.info(f"Retrying LLM call for {username} (attempt {attempt + 2})")
+                    time.sleep(1)
+                    continue
+                else:
+                    raise ValueError("LLM returned empty or whitespace answer after all retries")
+            
+            final_answer = processed_answer
+            break 
+        except Exception as e:
+            logger.error(f"❌ LLM error (Attempt {llm_actual_attempts}) for {username}: {e}", exc_info=True)
+            if attempt < MAX_LLM_RETRIES:
+                logger.info(f"Retrying LLM call for {username} (attempt {attempt + 2}) due to error.")
+                time.sleep(random.uniform(1,3))
+            else:
+                logger.error(f"❌ Failed to get LLM response for {username} after {llm_actual_attempts} attempts due to error: {e}")
+                # For HTTP response, use a generic error rather than potentially complex internal error string
+                raise HTTPException(status_code=500, detail="LLM 處理錯誤，請稍後再試或聯繫管理員。")
+    
     if final_answer is None:
-        logger.error(f"❌ Failed to get LLM response for user {username} after {MAX_LLM_RETRIES + 1} attempts.")
-        raise HTTPException(status_code=500, detail="LLM 回應或處理失敗 (LLM response or processing failed).")
+        logger.error(f"❌ Failed to get valid LLM response for {username} after {MAX_LLM_RETRIES + 1} attempts.")
+        raise HTTPException(status_code=500, detail="LLM 回應或處理失敗.")
 
     current_chat_session_messages = _get_user_chat_messages(username, session_id)
     current_chat_session_messages.append({"role": "user", "content": question})
@@ -894,182 +930,127 @@ async def process_rag_request(
         try:
             user_qa_log_dir = get_user_qa_log_path(username)
             today_str = datetime.now().strftime("%Y-%m-%d")
-            qa_filename = user_qa_log_dir / f"qa_log_{today_str}.jsonl" # Changed filename slightly for clarity
+            qa_filename = user_qa_log_dir / f"qa_log_{today_str}.jsonl"
             qa_record = {
                 "username_source_type": "api_call" if username.startswith("api_consumer_") else "frontend_user",
                 "user_identifier": username, "session_id": session_id, "timestamp": datetime.now().isoformat(),
-                "model": selected_model, "prompt_mode": prompt_mode, "format_mode": format_mode,
-                "question": question, "answer": final_answer, "llm_attempts": llm_actual_attempts,
-                "template_used": template_name_for_log, "retrieved_docs_count": len(docs_langchain if 'docs_langchain' in locals() else []),
+                "model": selected_model, "prompt_mode_requested": prompt_mode,
+                "format_mode_detected": format_mode, "question": question, "answer": final_answer,
+                "llm_attempts": llm_actual_attempts, "template_used": template_name_for_log,
+                "retrieved_docs_count": len(docs_langchain),
                 "total_processing_time_seconds": round(time.time() - start_all_processing, 2)
             }
-            with open(qa_filename, "a", encoding="utf-8") as f:
-                f.write(json.dumps(qa_record, ensure_ascii=False) + "\n")
-        except Exception as e:
-            logger.error(f"❌ Failed to save QA record for user {username}: {e}", exc_info=True)
+            with open(qa_filename, "a", encoding="utf-8") as f: f.write(json.dumps(qa_record, ensure_ascii=False) + "\n")
+        except Exception as e: logger.error(f"❌ Failed to save QA record for {username}: {e}", exc_info=True)
     
     llm_total_time = time.time() - start_llm_total_processing
-    retrieval_total_time = (time.time() - start_retrieve) if 'start_retrieve' in locals() else 0
+    retrieval_total_time = (time.time() - start_retrieve) if 'start_retrieve' in locals() and start_retrieve is not None else 0
 
     return {
-        "answer": final_answer,
-        "model_used": selected_model,
-        "prompt_mode_used": prompt_mode,
-        "format_mode_used": format_mode,
-        "template_style_used": template_name_for_log,
-        "sources": retrieved_docs_list, # Use the serializable list
+        "answer": final_answer, "model_used": selected_model,
+        "prompt_mode_used": prompt_mode, "format_mode_used": format_mode,
+        "template_style_used": template_name_for_log, "sources": retrieved_docs_list,
         "session_id": session_id,
         "llm_processing_time_seconds": round(llm_total_time, 2),
         "retrieval_time_seconds": round(retrieval_total_time, 2),
     }
 
-# --- MODIFIED: Original /chat endpoint now calls process_rag_request ---
-@app.post("/chat") # Original endpoint for your frontend
+@app.post("/chat")
 async def chat(req: ChatRequest, username: str = Depends(get_current_username)):
     start_overall_request = time.time()
-
     session_id = req.session_id
     question = req.question.strip()
-    selected_model = req.model if req.model in SUPPORTED_MODELS else DEFAULT_MODEL
-    prompt_mode = req.prompt_mode if req.prompt_mode in ["default", "research"] else "default"
-
+    selected_model = req.model if req.model and req.model in SUPPORTED_MODELS else DEFAULT_MODEL
+    prompt_mode_from_req = req.prompt_mode if req.prompt_mode in ["default", "research"] else "default"
     try:
         result_dict = await process_rag_request(
-            username=username,
-            session_id=session_id,
-            question=question,
-            selected_model=selected_model,
-            prompt_mode=prompt_mode
+            username=username, session_id=session_id, question=question,
+            selected_model=selected_model, prompt_mode=prompt_mode_from_req
         )
-
         total_time = time.time() - start_overall_request
-        logger.info(f"⏱️ Total /chat request time for user {username}: {total_time:.2f}s. "
-                    f"LLM time: {result_dict.get('llm_processing_time_seconds', 'N/A')}s. "
-                    f"Retrieval time: {result_dict.get('retrieval_time_seconds', 'N/A')}s")
-        
-        # Frontend expects this specific format
+        logger.info(f"⏱️ Total /chat request for {username}: {total_time:.2f}s. LLM: {result_dict.get('llm_processing_time_seconds', 'N/A')}s. Retrieval: {result_dict.get('retrieval_time_seconds', 'N/A')}s")
         return {
-            "answer": result_dict["answer"],
-            "model_used": result_dict["model_used"],
+            "answer": result_dict["answer"], "model_used": result_dict["model_used"],
             "prompt_mode_used": result_dict["prompt_mode_used"],
             "format_mode_used": result_dict["format_mode_used"],
             "template_style_used": result_dict["template_style_used"]
         }
     except HTTPException as e_http:
-        logger.error(f"HTTP Exception during /chat for user {username}: {e_http.detail}")
-        raise e_http # Re-raise if it's already an HTTPException (e.g., from process_rag_request)
+        logger.error(f"HTTP Exception during /chat for {username}: {e_http.detail}")
+        raise e_http
     except Exception as e_general:
-        logger.error(f"❌ Unexpected error in /chat for user {username}: {str(e_general)}", exc_info=True)
-        # Your original error response for /chat
-        return {"error": "LLM 回應或處理失敗或內部錯誤"}
+        logger.error(f"❌ Unexpected error in /chat for {username}: {str(e_general)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="LLM 回應或處理失敗或內部錯誤")
 
-
-# --- Feedback endpoint (Original - Unchanged) ---
 @app.post("/feedback")
 async def submit_feedback_for_user(feedback: FeedbackRequest, username: str = Depends(get_current_username)):
-    if not feedback.user_expected_answer:
-        raise HTTPException(status_code=400, detail="預期正確回答不能為空")
+    if not feedback.user_expected_answer: raise HTTPException(status_code=400, detail="預期正確回答不能為空")
     record = {
         "question": feedback.user_expected_question or feedback.question,
         "answer": feedback.user_expected_answer,
-        "metadata": {
-            "source": "manual_feedback", "original_question": feedback.question,
-            "original_answer": feedback.original_answer, "session_id": feedback.session_id,
-            "model_used": feedback.model, "timestamp": datetime.now().isoformat(),
-            "user_identifier": username # Log who submitted
-        }
+        "metadata": {"source": "manual_feedback", "original_question": feedback.question,
+                     "original_answer": feedback.original_answer, "session_id": feedback.session_id,
+                     "model_used": feedback.model, "timestamp": datetime.now().isoformat(),
+                     "user_identifier": username}
     }
     try:
         user_feedback_dir = get_user_feedback_save_path(username)
-        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S%f") # Added microsecond for more uniqueness
+        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S%f")
         filename = user_feedback_dir / f"feedback_{feedback.session_id}_{ts_str}.json"
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(record, f, ensure_ascii=False, indent=2)
+        with open(filename, "w", encoding="utf-8") as f: json.dump(record, f, ensure_ascii=False, indent=2)
         logger.info(f"📝 用戶 {username} 的回饋已保存到 {filename}")
         return {"message": "✅ 使用者回饋已儲存", "filename": str(filename)}
     except Exception as e:
         logger.error(f"❌ 保存用戶 {username} 的回饋失敗: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="儲存回饋失敗 (Failed to save feedback).")
+        raise HTTPException(status_code=500, detail="儲存回饋失敗.")
 
-# --- MODIFIED: New Pydantic models for Public API ---
 class PublicRAGRequest(BaseModel):
     question: str = Field(..., min_length=1, description="User's question for the RAG system.")
-    session_id: Optional[str] = Field(None, description="Optional session ID for multi-turn conversations. If not provided, a new session will be initiated by the system based on API key.")
-    model: Optional[str] = Field(DEFAULT_MODEL, description=f"Optional LLM model to use. Supported: {', '.join(SUPPORTED_MODELS)}. Defaults to {DEFAULT_MODEL}.")
+    session_id: Optional[str] = Field(None, description="Optional session ID.")
+    model: Optional[str] = Field(DEFAULT_MODEL, description=f"Optional LLM. Supported: {', '.join(SUPPORTED_MODELS)}. Defaults to {DEFAULT_MODEL}.")
     prompt_mode: Optional[str] = Field("default", description="Optional prompt mode. Supported: 'default', 'research'. Defaults to 'default'.")
 
 class PublicRAGResponse(BaseModel):
-    answer: str
-    model_used: str
-    prompt_mode_used: str
-    format_mode_used: str
+    answer: str; model_used: str; prompt_mode_used: str; format_mode_used: str
     template_style_used: Optional[str] = None
-    sources: List[PublicRAGDocumentSource] # Re-using the one defined above process_rag_request
+    sources: List[PublicRAGDocumentSource]
     session_id: str
     llm_processing_time_seconds: Optional[float] = None
     retrieval_time_seconds: Optional[float] = None
     total_request_time_seconds: Optional[float] = None
 
+public_api_v1_router = APIRouter(prefix="/api/v1/public", tags=["Public RAG API v1 (X-API-Key Auth)"])
 
-# --- MODIFIED: New Router and Endpoint for Public API ---
-public_api_v1_router = APIRouter(
-    prefix="/api/v1/public",
-    tags=["Public RAG API v1 (X-API-Key Auth)"] # Tag for Swagger UI grouping
-)
-
-@public_api_v1_router.post(
-    "/rag/ask",
-    response_model=PublicRAGResponse,
-    summary="Ask the RAG system (API Key)",
-    description="""
-    Send a question to the RAG system and receive an answer augmented with retrieved context.
-    Requires `X-API-Key` in the header for authentication.
-    Use the returned `session_id` for follow-up questions in the same conversation.
-    """
-)
-async def public_rag_ask(
-    req: PublicRAGRequest,
-    api_user_identifier: str = Depends(get_api_key_user) # Handles API key auth
-):
+@public_api_v1_router.post("/rag/ask", response_model=PublicRAGResponse, summary="Ask the RAG system (API Key)")
+async def public_rag_ask(req: PublicRAGRequest, api_user_identifier: str = Depends(get_api_key_user)):
     start_overall_request = time.time()
-
     session_id_to_use = req.session_id
     if not session_id_to_use:
-        # Generate a unique session ID for this API user if not provided
         timestamp_ms = int(time.time() * 1000)
         random_suffix = random.randint(10000, 99999)
-        session_id_to_use = f"api_{api_user_identifier.replace('_','-')[:10]}_{timestamp_ms}_{random_suffix}" # Ensure session_id is somewhat readable and unique
-        logger.info(f"No session_id provided by API user '{api_user_identifier}', generated: '{session_id_to_use}'")
-
+        session_id_to_use = f"api_{api_user_identifier.replace('_','-')[:10]}_{timestamp_ms}_{random_suffix}"
+        logger.info(f"No session_id by API user '{api_user_identifier}', generated: '{session_id_to_use}'")
+    
+    selected_model_for_api = req.model if req.model and req.model in SUPPORTED_MODELS else DEFAULT_MODEL
+    prompt_mode_for_api = req.prompt_mode if req.prompt_mode in ["default", "research"] else "default"
     try:
         result_dict = await process_rag_request(
-            username=api_user_identifier, # API Key's associated identifier acts as username
-            session_id=session_id_to_use,
-            question=req.question,
-            selected_model=req.model,
-            prompt_mode=req.prompt_mode,
+            username=api_user_identifier, session_id=session_id_to_use, question=req.question,
+            selected_model=selected_model_for_api, prompt_mode=prompt_mode_for_api,
         )
-
         total_time = time.time() - start_overall_request
         result_dict["total_request_time_seconds"] = round(total_time, 2)
-        
-        logger.info(f"⏱️ Total Public API request time for API user '{api_user_identifier}': {total_time:.2f}s. "
-                    f"LLM: {result_dict.get('llm_processing_time_seconds','N/A')}s. "
-                    f"Retrieval: {result_dict.get('retrieval_time_seconds','N/A')}s")
-
+        logger.info(f"⏱️ Total Public API request for API user '{api_user_identifier}': {total_time:.2f}s. LLM: {result_dict.get('llm_processing_time_seconds','N/A')}s. Retrieval: {result_dict.get('retrieval_time_seconds','N/A')}s")
         return PublicRAGResponse(**result_dict)
-
     except HTTPException as e_http:
-        logger.error(f"HTTP Exception during Public API call for user '{api_user_identifier}': {e_http.detail}")
+        logger.error(f"HTTP Exception Public API for user '{api_user_identifier}': {e_http.detail}")
         raise e_http
     except Exception as e_general:
-        logger.error(f"❌ Unexpected error in public_rag_ask for API user '{api_user_identifier}': {str(e_general)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal server error occurred while processing your RAG request.")
+        logger.error(f"❌ Unexpected error public_rag_ask for API user '{api_user_identifier}': {str(e_general)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error processing RAG request.")
 
+app.include_router(api_router)
+app.include_router(public_api_v1_router)
 
-# --- MODIFIED: Include all routers in the app ---
-app.include_router(api_router) # For existing frontend-facing APIs (/api/chats, etc.)
-app.include_router(public_api_v1_router) # For new public API
-
-# Command to run:
-# uvicorn 5_20test:app --host 0.0.0.0 --port 8000 --reload  #此為api的後端模型
+# To run (replace `your_filename` with the actual name of your Python file):
+# uvicorn 5_26:app --host 0.0.0.0 --port 8000 --reload  目前最主要模型  修改使用者自定義的prompt
