@@ -64,9 +64,6 @@ npm install
 啟動開發伺服器：
 npm run dev
 
-打開瀏覽器前往：
-http://localhost:5173
-
 ⚙️ 後端（FastAPI + LangChain + ChromaDB）
 進入後端資料夾：
 cd backend
