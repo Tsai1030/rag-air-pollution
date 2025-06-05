@@ -77,3 +77,9 @@ http://127.0.0.1:8000/docs
 | **模型部署**   | 搭配 Ollama 進行本地 LLM 部署，可支援 Gemma 3B、Qwen 14B 等模型      |
 | **評估機制**   | 可搭配 RAGAS 框架進行忠實度、語意相關性等指標的自動評估                      |
 
+
+## 🌈 系統展示畫面
+
+![RAG 系統展示圖](https://github.com/Tsai1030/rag-air-pollution/blob/main/frontend/public/images/%E5%B1%95%E7%A4%BA%E7%85%A7%E7%89%87.png?raw=true)
+
+
