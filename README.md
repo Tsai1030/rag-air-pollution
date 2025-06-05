@@ -18,6 +18,7 @@ http://163.15.172.93:3000/
 
 ## 📁 專案結構
 
+```
 rag-air-project/
 ├── .git/                   # Git 版本控制資料夾（自動產生）
 ├── .gitignore              # Git 忽略規則設定檔
@@ -25,7 +26,8 @@ rag-air-project/
 ├── README.md               # 專案說明文件
 ├── backend/                # FastAPI 後端程式碼
 ├── frontend/               # React + Vite 前端程式碼
-
+│   └── public/images/      # 前端展示用圖片（包含展示照片.png）
+```
 
 ## 🐍 Conda 環境建立說明
 
