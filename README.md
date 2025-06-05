@@ -4,13 +4,18 @@ description: A LangChain + Chroma + Ollama powered retrieval-augmented chatbot s
 keywords: RAG, LangChain, air pollution, chatbot, QA system, fastapi, react, chromadb, gemma, qwen
 -->
 
-
 # 🌱 RAG 空氣污染問答系統 (RAG-based QA System on Air Pollution)
 
-本專案為一套結合語意檢索與生成式 AI 的問答系統，針對空氣污染政策、健康影響與環境法規等主題，提供精準、可查證的回應。使用者可透過前端網頁介面進行提問，系統將利用 RAG 技術結合本地文件資料庫進行語意查詢與回答生成。
+本專案為一套結合語意檢索（Retrieval-Augmented Generation, RAG）與生成式 AI 的智慧型問答系統，針對空氣污染政策、健康影響與環境法規等主題，提供即時、精準且具可查證性的回應。使用者可透過網頁前端介面自由提問，系統將透過語意向量檢索技術，從本地文件知識庫中找出相關內容，並結合大型語言模型進行答案生成。
+
+本系統後端以 FastAPI 為基礎，整合 LangChain 框架與 Chroma 向量資料庫，實作語意檢索與知識融合邏輯。Embedding 向量模型由 HuggingFace 匯入（如 `BAAI/bge-m3`），具備高效中文語意理解能力；本地大型語言模型則透過 Ollama 部屬，支援如 Gemma 3:12B 模型進行回應生成，具備穩定、高效且離線可執行的優勢。
+
+前端介面使用 React + Vite 開發，支援即時提問、Markdown 回應格式呈現、歷史紀錄與使用者回饋機制。整體系統採前後端分離架構，支援多模型切換、語意斷句、文件結構化與自動評估指標整合。
+
+系統中特別設計了一套 Prompt 策略模組，可隨機選擇不同風格的回答格式（如條列式、段落式、Emoji 風格等），以提升回答多樣性與親和力；若使用者於提問中明確指定回應格式（如「請用條列式回覆」），系統將優先依照指令執行，確保符合需求並提升互動體驗。
 
 ---
-## 線上rag系統測試  歡迎提供任何意見 感謝
+## 線上RAG系統測試  歡迎提供任何建議 感謝
 http://163.15.172.93:3000/
 
 ## 🔄 資料處理
