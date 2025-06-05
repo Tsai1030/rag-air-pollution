@@ -41,7 +41,7 @@ rag-air-project/
 │   └── public/images/      # 前端展示用圖片（包含展示照片.png）
 ```
 
-## 🐍 Conda 環境建立說明
+## <img src="https://github.com/Tsai1030/rag-air-pollution/blob/main/frontend/public/images/CONDA_IMG.png?raw=true" alt="Conda Logo" width="26" style="vertical-align: middle;"/> Conda 環境建立說明
 
 請確認你已安裝 [Anaconda](https://www.anaconda.com/) 或 Miniconda，然後執行以下指令建立專案環境：
 
