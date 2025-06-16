@@ -16,7 +16,7 @@ keywords: RAG, LangChain, air pollution, chatbot, QA system, fastapi, react, chr
 
 ---
 ## 線上RAG系統測試  歡迎提供任何建議 感謝
-http://163.15.172.93:3000/
+http://kmu-rag.duckdns.org/
 
 ## 🔄 資料處理
 資料切割上 設定QA的文本是不進行切割的，只切割長文本
