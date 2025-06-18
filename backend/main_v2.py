@@ -1384,4 +1384,4 @@ app.include_router(public_api_v1_router)
 # To run (replace `your_filename` with the actual name of your Python file):
 # uvicorn 6_10test:app --host 0.0.0.0 --port 8000 --reload   6/11 有微調prompt 如果效果不好就用這個 目前較為準確的版本  6/18為目前最優先後端
 
-# 使用分離的IP  uvicorn 6_10test:app --host 0.0.0.0 --port 8000  目前先使用這個 Duck DNS和Nginx
+# 使用分離的IP  uvicorn 6_10test:app --host 0.0.0.0 --port 8000  目前先使用這個 Duck DNS 和 Nginx
