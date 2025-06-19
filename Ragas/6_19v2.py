@@ -18,7 +18,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- 修改：LLM 初始化分離 ---
 # 1. 用於答案生成和精煉的 LLM (可以選擇較大的模型)
-answer_generation_llm_model_name = "gemma3:27b" # 使用更大更穩定的模型  # mistral-small3.1:latest 1,1,72還不錯
+answer_generation_llm_model_name = "gemma3:12b" # 使用更大更穩定的模型  # mistral-small3.1:latest 1,1,72還不錯 gemma3:27b
 print(f"答案生成/精煉 LLM: {answer_generation_llm_model_name}")
 answer_generation_llm = OllamaLLM(
     model=answer_generation_llm_model_name,
@@ -29,7 +29,7 @@ answer_generation_llm = OllamaLLM(
 )
 
 # 2. 用於 RAGAS 評估的 LLM (選擇一個穩定運行的較小模型)
-ragas_evaluation_llm_model_name = "llama3.1:8b-instruct-fp16"#"gemma2:9b-instruct-fp16"
+ragas_evaluation_llm_model_name = "gemma2:9b-instruct-fp16" #"llama3.1:8b-instruct-fp16" #"gemma2:9b-instruct-fp16"
 print(f"RAGAS 評估 LLM: {ragas_evaluation_llm_model_name}")
 ragas_evaluation_llm = OllamaLLM(
     model=ragas_evaluation_llm_model_name,
@@ -51,7 +51,7 @@ ragas_emb = LangchainEmbeddingsWrapper(emb)
 
 # --- 向量庫和檢索器 ---
 vector_store = Chroma(
-    persist_directory="6_17ragas",
+    persist_directory="6_20ragas",
     embedding_function=emb,
 )
 
@@ -70,7 +70,7 @@ def hierarchical_retrieval(question, vector_store, top_k=3):
     if len(docs_high) < top_k:
         medium_threshold_retriever = vector_store.as_retriever(
             search_type="similarity_score_threshold", 
-            search_kwargs={"k": top_k*2, "score_threshold": 0.8}
+            search_kwargs={"k": top_k*2, "score_threshold": 0.5} #第一次設置0.8
         )
         docs_medium = medium_threshold_retriever.invoke(f"query: {question}")
         
@@ -320,7 +320,7 @@ def safe_evaluate(sample_dataset, question_str):
 print("\n⚙️ 開始分批 RAGAS 評估...")
 print("🔬 第一階段：測試前3題...")
 
-test_samples = samples[:3]  # 先測試前3個問題
+test_samples = samples  # 先測試前3個問題 [:3]
 test_results_dfs = []
 
 for i, sample_data in enumerate(test_samples):
