@@ -425,4 +425,4 @@ const parseMarkdown = useCallback((markdownText) => {
       {modalState?.type === 'delete' && ( <DeleteChatModal chatId={modalState.chatId} onConfirm={confirmDelete} onCancel={closeModal} /> )}
     </>
   );
-}
+}                   
